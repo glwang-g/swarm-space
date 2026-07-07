@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy::window::WindowResolution;
+use bevy::window::{PrimaryWindow, WindowResolution};
 use rand::random_range;
 
 // —— 常量 ——
@@ -64,20 +64,29 @@ struct PrevGridPos(IVec2);
 #[derive(Resource)]
 struct MoveTimer(Timer);
 
+#[derive(Resource, PartialEq, Eq, Clone, Copy)]
+enum GameState {
+    Playing,
+    GameOver,
+}
+
 #[derive(Resource)]
 struct Snake {
-    /// 从头到尾的实体列表
     body: Vec<Entity>,
     direction: Direction,
     pending: Option<Direction>,
-    /// 下一次 tick 时是否要长一节
     pending_grow: bool,
 }
 
+// —— 工具函数 ——
 fn grid_to_pixel(pos: IVec2) -> Vec3 {
     let x = (pos.x as f32 - GRID_WIDTH as f32 / 2.0 + 0.5) * CELL_SIZE;
     let y = (pos.y as f32 - GRID_HEIGHT as f32 / 2.0 + 0.5) * CELL_SIZE;
     Vec3::new(x, y, 0.0)
+}
+
+fn in_bounds(pos: IVec2) -> bool {
+    pos.x >= 0 && pos.x < GRID_WIDTH && pos.y >= 0 && pos.y < GRID_HEIGHT
 }
 
 fn random_empty_cell(occupied: &[IVec2]) -> IVec2 {
@@ -104,6 +113,34 @@ fn spawn_snake_part(commands: &mut Commands, pos: IVec2, color: Color) -> Entity
         .id()
 }
 
+fn spawn_food(commands: &mut Commands, pos: IVec2) {
+    commands.spawn((
+        Food,
+        GridPos(pos),
+        Sprite::from_color(FOOD_COLOR, Vec2::splat(CELL_SIZE - SPRITE_INSET - 2.0)),
+        Transform::from_translation(grid_to_pixel(pos)),
+    ));
+}
+
+fn spawn_initial_snake(commands: &mut Commands) -> (Vec<Entity>, Vec<IVec2>) {
+    let head = IVec2::new(GRID_WIDTH / 2, GRID_HEIGHT / 2);
+    let positions = vec![head, head - IVec2::new(1, 0), head - IVec2::new(2, 0)];
+    let mut entities = Vec::with_capacity(positions.len());
+    for (i, &pos) in positions.iter().enumerate() {
+        let color = if i == 0 { HEAD_COLOR } else { BODY_COLOR };
+        entities.push(spawn_snake_part(commands, pos, color));
+    }
+    (entities, positions)
+}
+
+fn set_window_title(window: &mut Window, state: GameState) {
+    window.title = match state {
+        GameState::Playing => "Bevy Snake".to_string(),
+        GameState::GameOver => "Bevy Snake — Game Over (press R to restart)".to_string(),
+    };
+}
+
+// —— Startup ——
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
 
@@ -120,38 +157,20 @@ fn setup(mut commands: Commands) {
         }
     }
 
-    // 初始蛇：3 节水平摆放，头在正中
-    let head_pos = IVec2::new(GRID_WIDTH / 2, GRID_HEIGHT / 2);
-    let body_positions = vec![
-        head_pos,
-        head_pos - IVec2::new(1, 0),
-        head_pos - IVec2::new(2, 0),
-    ];
-
-    let mut body_entities = Vec::with_capacity(body_positions.len());
-    for (i, &pos) in body_positions.iter().enumerate() {
-        let color = if i == 0 { HEAD_COLOR } else { BODY_COLOR };
-        body_entities.push(spawn_snake_part(&mut commands, pos, color));
-    }
-
+    // 初始蛇
+    let (entities, positions) = spawn_initial_snake(&mut commands);
     commands.insert_resource(Snake {
-        body: body_entities,
+        body: entities,
         direction: Direction::Right,
         pending: None,
         pending_grow: false,
     });
 
     // 食物
-    let food_pos = random_empty_cell(&body_positions);
-    commands.spawn((
-        Food,
-        GridPos(food_pos),
-        Sprite::from_color(FOOD_COLOR, Vec2::splat(CELL_SIZE - SPRITE_INSET - 2.0)),
-        Transform::from_translation(grid_to_pixel(food_pos)),
-    ));
+    spawn_food(&mut commands, random_empty_cell(&positions));
 }
 
-// —— 系统：读键盘 ——
+// —— 系统:读键盘 ——
 fn read_input(keys: Res<ButtonInput<KeyCode>>, mut snake: ResMut<Snake>) {
     let new_dir = if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
         Some(Direction::Up)
@@ -173,24 +192,24 @@ fn read_input(keys: Res<ButtonInput<KeyCode>>, mut snake: ResMut<Snake>) {
     }
 }
 
-// —— 系统：到 tick 时整条蛇前推 ——
+// —— 系统:到 tick 时前推整条蛇；顺便做碰撞检测 ——
 fn tick_snake(
     time: Res<Time>,
     mut timer: ResMut<MoveTimer>,
     mut commands: Commands,
     mut snake: ResMut<Snake>,
+    mut state: ResMut<GameState>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut query: Query<(&mut GridPos, &mut PrevGridPos), With<SnakePart>>,
 ) {
     if !timer.0.tick(time.delta()).just_finished() {
         return;
     }
 
-    // 应用缓冲的转向
     if let Some(dir) = snake.pending.take() {
         snake.direction = dir;
     }
 
-    // 收集当前所有节的位置（只读借用，用完就还）
     let positions: Vec<IVec2> = snake
         .body
         .iter()
@@ -203,7 +222,27 @@ fn tick_snake(
     let new_head = positions[0] + snake.direction.as_ivec();
     let old_tail = *positions.last().unwrap();
 
-    // 依次把每一节推到"前一节的旧位置"（头 = 新位置）
+    // —— 碰撞检测 ——
+    // 撞墙
+    let out_of_bounds = !in_bounds(new_head);
+    // 撞自己：新头位置和"移动后依然存在的身体段"重合
+    //   如果不生长：尾巴会让位，所以只查 positions[..len-1]
+    //   如果生长：尾巴不让位，要查所有
+    let will_hit_self = if snake.pending_grow {
+        positions.contains(&new_head)
+    } else {
+        positions[..positions.len() - 1].contains(&new_head)
+    };
+
+    if out_of_bounds || will_hit_self {
+        *state = GameState::GameOver;
+        if let Ok(mut window) = windows.single_mut() {
+            set_window_title(&mut window, GameState::GameOver);
+        }
+        return;
+    }
+
+    // —— 前推所有节 ——
     for (i, &entity) in snake.body.iter().enumerate() {
         if let Ok((mut pos, mut prev)) = query.get_mut(entity) {
             prev.0 = positions[i];
@@ -211,7 +250,7 @@ fn tick_snake(
         }
     }
 
-    // 如果有 pending_grow，在原尾巴位置新增一节
+    // —— 生长 ——
     if snake.pending_grow {
         snake.pending_grow = false;
         let entity = spawn_snake_part(&mut commands, old_tail, BODY_COLOR);
@@ -223,31 +262,24 @@ fn tick_snake(
 fn eat_food(
     mut commands: Commands,
     mut snake: ResMut<Snake>,
-    snake_pos_query: Query<&GridPos, With<SnakePart>>,
+    pos_query: Query<&GridPos, With<SnakePart>>,
     food_query: Query<(Entity, &GridPos), With<Food>>,
 ) {
     let Some(&head_entity) = snake.body.first() else { return };
-    let Ok(head_pos) = snake_pos_query.get(head_entity) else { return };
+    let Ok(head_pos) = pos_query.get(head_entity) else { return };
     let head_grid = head_pos.0;
 
-    // 生成新食物要避开的位置 = 整条蛇
     let occupied: Vec<IVec2> = snake
         .body
         .iter()
-        .filter_map(|&e| snake_pos_query.get(e).ok().map(|p| p.0))
+        .filter_map(|&e| pos_query.get(e).ok().map(|p| p.0))
         .collect();
 
     for (food_entity, food_pos) in &food_query {
         if head_grid == food_pos.0 {
             commands.entity(food_entity).despawn();
             snake.pending_grow = true;
-            let new_pos = random_empty_cell(&occupied);
-            commands.spawn((
-                Food,
-                GridPos(new_pos),
-                Sprite::from_color(FOOD_COLOR, Vec2::splat(CELL_SIZE - SPRITE_INSET - 2.0)),
-                Transform::from_translation(grid_to_pixel(new_pos)),
-            ));
+            spawn_food(&mut commands, random_empty_cell(&occupied));
         }
     }
 }
@@ -267,6 +299,52 @@ fn interpolate_visual(
     }
 }
 
+// —— 系统:游戏结束时按 R 重开 ——
+fn handle_restart(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut snake: ResMut<Snake>,
+    mut state: ResMut<GameState>,
+    mut timer: ResMut<MoveTimer>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    parts: Query<Entity, With<SnakePart>>,
+    foods: Query<Entity, With<Food>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyR) {
+        return;
+    }
+
+    // 清场
+    for e in &parts {
+        commands.entity(e).despawn();
+    }
+    for e in &foods {
+        commands.entity(e).despawn();
+    }
+
+    // 重建蛇和食物
+    let (entities, positions) = spawn_initial_snake(&mut commands);
+    snake.body = entities;
+    snake.direction = Direction::Right;
+    snake.pending = None;
+    snake.pending_grow = false;
+    spawn_food(&mut commands, random_empty_cell(&positions));
+
+    timer.0.reset();
+    *state = GameState::Playing;
+    if let Ok(mut window) = windows.single_mut() {
+        set_window_title(&mut window, GameState::Playing);
+    }
+}
+
+// —— run_if 条件 ——
+fn is_playing(state: Res<GameState>) -> bool {
+    *state == GameState::Playing
+}
+fn is_game_over(state: Res<GameState>) -> bool {
+    *state == GameState::GameOver
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -279,6 +357,7 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(BG_DARK))
+        .insert_resource(GameState::Playing)
         .insert_resource(MoveTimer(Timer::from_seconds(
             TICK_SECONDS,
             TimerMode::Repeating,
@@ -286,7 +365,11 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (read_input, tick_snake, eat_food, interpolate_visual).chain(),
+            (read_input, tick_snake, eat_food)
+                .chain()
+                .run_if(is_playing),
         )
+        .add_systems(Update, interpolate_visual)
+        .add_systems(Update, handle_restart.run_if(is_game_over))
         .run();
 }
