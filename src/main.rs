@@ -171,7 +171,11 @@ fn setup(mut commands: Commands) {
 }
 
 // —— 系统:读键盘 ——
-fn read_input(keys: Res<ButtonInput<KeyCode>>, mut snake: ResMut<Snake>) {
+fn read_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut snake: ResMut<Snake>,
+    mut timer: ResMut<MoveTimer>,
+) {
     let new_dir = if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
         Some(Direction::Up)
     } else if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
@@ -189,6 +193,13 @@ fn read_input(keys: Res<ButtonInput<KeyCode>>, mut snake: ResMut<Snake>) {
         && dir != snake.direction.opposite()
     {
         snake.pending = Some(dir);
+        // "eager input"：让 tick 立刻发生，消除按键到响应的延迟
+        // 只在还有一段时间才到 tick 时才提前，避免刚好在 tick 边缘重复触发
+        let remaining = timer.0.remaining_secs();
+        if remaining > TICK_SECONDS * 0.5 {
+            let duration = timer.0.duration();
+            timer.0.set_elapsed(duration);
+        }
     }
 }
 
