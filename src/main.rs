@@ -60,9 +60,16 @@ struct GridPos(IVec2);
 #[derive(Component, Clone, Copy)]
 struct PrevGridPos(IVec2);
 
+/// 标记：这是分数文本，供 UI 更新系统定位
+#[derive(Component)]
+struct ScoreText;
+
 // —— 资源 ——
 #[derive(Resource)]
 struct MoveTimer(Timer);
+
+#[derive(Resource, Default)]
+struct Score(u32);
 
 #[derive(Resource, PartialEq, Eq, Clone, Copy)]
 enum GameState {
@@ -168,6 +175,23 @@ fn setup(mut commands: Commands) {
 
     // 食物
     spawn_food(&mut commands, random_empty_cell(&positions));
+
+    // 分数 UI:右上角文本
+    commands.spawn((
+        ScoreText,
+        Text::new("Score: 0"),
+        TextFont {
+            font_size: FontSize::Px(22.0),
+            ..default()
+        },
+        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            right: Val::Px(14.0),
+            ..default()
+        },
+    ));
 }
 
 // —— 系统:读键盘 ——
@@ -273,6 +297,7 @@ fn tick_snake(
 fn eat_food(
     mut commands: Commands,
     mut snake: ResMut<Snake>,
+    mut score: ResMut<Score>,
     pos_query: Query<&GridPos, With<SnakePart>>,
     food_query: Query<(Entity, &GridPos), With<Food>>,
 ) {
@@ -290,8 +315,22 @@ fn eat_food(
         if head_grid == food_pos.0 {
             commands.entity(food_entity).despawn();
             snake.pending_grow = true;
+            score.0 += 1;
             spawn_food(&mut commands, random_empty_cell(&occupied));
         }
+    }
+}
+
+// —— 系统:分数变化时刷新 UI 文本 ——
+fn update_score_text(
+    score: Res<Score>,
+    mut query: Query<&mut Text, With<ScoreText>>,
+) {
+    if !score.is_changed() {
+        return;
+    }
+    for mut text in &mut query {
+        text.0 = format!("Score: {}", score.0);
     }
 }
 
@@ -317,6 +356,7 @@ fn handle_restart(
     mut snake: ResMut<Snake>,
     mut state: ResMut<GameState>,
     mut timer: ResMut<MoveTimer>,
+    mut score: ResMut<Score>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     parts: Query<Entity, With<SnakePart>>,
     foods: Query<Entity, With<Food>>,
@@ -342,6 +382,7 @@ fn handle_restart(
     spawn_food(&mut commands, random_empty_cell(&positions));
 
     timer.0.reset();
+    score.0 = 0;
     *state = GameState::Playing;
     if let Ok(mut window) = windows.single_mut() {
         set_window_title(&mut window, GameState::Playing);
@@ -369,6 +410,7 @@ fn main() {
         }))
         .insert_resource(ClearColor(BG_DARK))
         .insert_resource(GameState::Playing)
+        .insert_resource(Score::default())
         .insert_resource(MoveTimer(Timer::from_seconds(
             TICK_SECONDS,
             TimerMode::Repeating,
@@ -381,6 +423,7 @@ fn main() {
                 .run_if(is_playing),
         )
         .add_systems(Update, interpolate_visual)
+        .add_systems(Update, update_score_text)
         .add_systems(Update, handle_restart.run_if(is_game_over))
         .run();
 }
