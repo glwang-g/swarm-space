@@ -60,6 +60,7 @@ struct GridPos(IVec2);
 #[derive(Component, Clone, Copy)]
 struct PrevGridPos(IVec2);
 
+/// 标记：这是分数文本，供 UI 更新系统定位
 #[derive(Component)]
 struct ScoreText;
 
@@ -230,6 +231,8 @@ fn read_input(
         && dir != snake.direction.opposite()
     {
         snake.pending = Some(dir);
+        // "eager input"：让 tick 立刻发生，消除按键到响应的延迟
+        // 只在还有一段时间才到 tick 时才提前，避免刚好在 tick 边缘重复触发
         let remaining = timer.0.remaining_secs();
         if remaining > TICK_SECONDS * 0.5 {
             let duration = timer.0.duration();
@@ -268,7 +271,11 @@ fn tick_snake(
     let old_tail = *positions.last().unwrap();
 
     // —— 碰撞检测 ——
+    // 撞墙
     let out_of_bounds = !in_bounds(new_head);
+    // 撞自己：新头位置和"移动后依然存在的身体段"重合
+    //   如果不生长：尾巴会让位，所以只查 positions[..len-1]
+    //   如果生长：尾巴不让位，要查所有
     let will_hit_self = if snake.pending_grow {
         positions.contains(&new_head)
     } else {
@@ -410,6 +417,7 @@ fn handle_restart(
         return;
     }
 
+    // 清场
     for e in &parts {
         commands.entity(e).despawn();
     }
@@ -417,6 +425,7 @@ fn handle_restart(
         commands.entity(e).despawn();
     }
 
+    // 重建蛇和食物
     let (entities, positions) = spawn_initial_snake(&mut commands);
     snake.body = entities;
     snake.direction = Direction::Right;
