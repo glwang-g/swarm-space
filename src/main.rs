@@ -60,7 +60,6 @@ struct GridPos(IVec2);
 #[derive(Component, Clone, Copy)]
 struct PrevGridPos(IVec2);
 
-/// 标记：这是分数文本，供 UI 更新系统定位
 #[derive(Component)]
 struct ScoreText;
 
@@ -84,6 +83,20 @@ struct Snake {
     pending: Option<Direction>,
     pending_grow: bool,
 }
+
+// —— 消息（Bevy 0.19 里 Event 更名为 Message，强调"数据流"而非回调）——
+/// 蛇头刚吃到食物。多个订阅者可以并行处理：加长、加分、生成新食物、播音效等。
+#[derive(Message)]
+struct AteFoodEvent {
+    food_entity: Entity,
+    /// 被吃位置——目前未订阅，留给以后的粒子特效/音效订阅者用
+    #[allow(dead_code)]
+    at: IVec2,
+}
+
+/// 蛇死亡:撞墙或撞自己。订阅者处理状态切换、UI 更新、播音效等。
+#[derive(Message, Default)]
+struct GameOverEvent;
 
 // —— 工具函数 ——
 fn grid_to_pixel(pos: IVec2) -> Vec3 {
@@ -217,8 +230,6 @@ fn read_input(
         && dir != snake.direction.opposite()
     {
         snake.pending = Some(dir);
-        // "eager input"：让 tick 立刻发生，消除按键到响应的延迟
-        // 只在还有一段时间才到 tick 时才提前，避免刚好在 tick 边缘重复触发
         let remaining = timer.0.remaining_secs();
         if remaining > TICK_SECONDS * 0.5 {
             let duration = timer.0.duration();
@@ -227,14 +238,13 @@ fn read_input(
     }
 }
 
-// —— 系统:到 tick 时前推整条蛇；顺便做碰撞检测 ——
+// —— 系统:到 tick 时前推整条蛇；碰撞则发出 GameOverEvent ——
 fn tick_snake(
     time: Res<Time>,
     mut timer: ResMut<MoveTimer>,
     mut commands: Commands,
     mut snake: ResMut<Snake>,
-    mut state: ResMut<GameState>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut game_over: MessageWriter<GameOverEvent>,
     mut query: Query<(&mut GridPos, &mut PrevGridPos), With<SnakePart>>,
 ) {
     if !timer.0.tick(time.delta()).just_finished() {
@@ -258,11 +268,7 @@ fn tick_snake(
     let old_tail = *positions.last().unwrap();
 
     // —— 碰撞检测 ——
-    // 撞墙
     let out_of_bounds = !in_bounds(new_head);
-    // 撞自己：新头位置和"移动后依然存在的身体段"重合
-    //   如果不生长：尾巴会让位，所以只查 positions[..len-1]
-    //   如果生长：尾巴不让位，要查所有
     let will_hit_self = if snake.pending_grow {
         positions.contains(&new_head)
     } else {
@@ -270,10 +276,7 @@ fn tick_snake(
     };
 
     if out_of_bounds || will_hit_self {
-        *state = GameState::GameOver;
-        if let Ok(mut window) = windows.single_mut() {
-            set_window_title(&mut window, GameState::GameOver);
-        }
+        game_over.write(GameOverEvent);
         return;
     }
 
@@ -293,44 +296,76 @@ fn tick_snake(
     }
 }
 
-// —— 系统:吃食物 ——
-fn eat_food(
-    mut commands: Commands,
-    mut snake: ResMut<Snake>,
-    mut score: ResMut<Score>,
+// —— 系统:检测吃食物,只发事件 ——
+fn detect_food_eaten(
+    snake: Res<Snake>,
     pos_query: Query<&GridPos, With<SnakePart>>,
     food_query: Query<(Entity, &GridPos), With<Food>>,
+    mut events: MessageWriter<AteFoodEvent>,
 ) {
     let Some(&head_entity) = snake.body.first() else { return };
     let Ok(head_pos) = pos_query.get(head_entity) else { return };
-    let head_grid = head_pos.0;
-
-    let occupied: Vec<IVec2> = snake
-        .body
-        .iter()
-        .filter_map(|&e| pos_query.get(e).ok().map(|p| p.0))
-        .collect();
-
     for (food_entity, food_pos) in &food_query {
-        if head_grid == food_pos.0 {
-            commands.entity(food_entity).despawn();
-            snake.pending_grow = true;
-            score.0 += 1;
-            spawn_food(&mut commands, random_empty_cell(&occupied));
+        if head_pos.0 == food_pos.0 {
+            events.write(AteFoodEvent {
+                food_entity,
+                at: food_pos.0,
+            });
         }
     }
 }
 
-// —— 系统:分数变化时刷新 UI 文本 ——
-fn update_score_text(
-    score: Res<Score>,
-    mut query: Query<&mut Text, With<ScoreText>>,
-) {
-    if !score.is_changed() {
-        return;
+// —— 订阅 AteFoodEvent:蛇准备加长 ——
+fn grow_snake_on_eat(mut events: MessageReader<AteFoodEvent>, mut snake: ResMut<Snake>) {
+    for _ in events.read() {
+        snake.pending_grow = true;
     }
-    for mut text in &mut query {
-        text.0 = format!("Score: {}", score.0);
+}
+
+// —— 订阅 AteFoodEvent:加分 ——
+fn award_score_on_eat(mut events: MessageReader<AteFoodEvent>, mut score: ResMut<Score>) {
+    for _ in events.read() {
+        score.0 += 1;
+    }
+}
+
+// —— 订阅 AteFoodEvent:清除旧食物、生成新食物 ——
+fn respawn_food_on_eat(
+    mut events: MessageReader<AteFoodEvent>,
+    mut commands: Commands,
+    snake: Res<Snake>,
+    pos_query: Query<&GridPos, With<SnakePart>>,
+) {
+    for ev in events.read() {
+        commands.entity(ev.food_entity).despawn();
+        let occupied: Vec<IVec2> = snake
+            .body
+            .iter()
+            .filter_map(|&e| pos_query.get(e).ok().map(|p| p.0))
+            .collect();
+        spawn_food(&mut commands, random_empty_cell(&occupied));
+    }
+}
+
+// —— 订阅 GameOverEvent:切换状态 ——
+fn transition_to_game_over(
+    mut events: MessageReader<GameOverEvent>,
+    mut state: ResMut<GameState>,
+) {
+    for _ in events.read() {
+        *state = GameState::GameOver;
+    }
+}
+
+// —— 订阅 GameOverEvent:更新窗口标题 ——
+fn update_window_on_game_over(
+    mut events: MessageReader<GameOverEvent>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    for _ in events.read() {
+        if let Ok(mut window) = windows.single_mut() {
+            set_window_title(&mut window, GameState::GameOver);
+        }
     }
 }
 
@@ -346,6 +381,16 @@ fn interpolate_visual(
         let lerped = from.lerp(to, t);
         transform.translation.x = lerped.x;
         transform.translation.y = lerped.y;
+    }
+}
+
+// —— 系统:分数变化时刷新 UI 文本 ——
+fn update_score_text(score: Res<Score>, mut query: Query<&mut Text, With<ScoreText>>) {
+    if !score.is_changed() {
+        return;
+    }
+    for mut text in &mut query {
+        text.0 = format!("Score: {}", score.0);
     }
 }
 
@@ -365,7 +410,6 @@ fn handle_restart(
         return;
     }
 
-    // 清场
     for e in &parts {
         commands.entity(e).despawn();
     }
@@ -373,7 +417,6 @@ fn handle_restart(
         commands.entity(e).despawn();
     }
 
-    // 重建蛇和食物
     let (entities, positions) = spawn_initial_snake(&mut commands);
     snake.body = entities;
     snake.direction = Direction::Right;
@@ -415,10 +458,21 @@ fn main() {
             TICK_SECONDS,
             TimerMode::Repeating,
         )))
+        .add_message::<AteFoodEvent>()
+        .add_message::<GameOverEvent>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (read_input, tick_snake, eat_food)
+            (
+                read_input,
+                tick_snake,
+                detect_food_eaten,
+                grow_snake_on_eat,
+                award_score_on_eat,
+                respawn_food_on_eat,
+                transition_to_game_over,
+                update_window_on_game_over,
+            )
                 .chain()
                 .run_if(is_playing),
         )
