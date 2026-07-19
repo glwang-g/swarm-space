@@ -1,492 +1,383 @@
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, WindowResolution};
-use rand::random_range;
+use bevy::window::{MonitorSelection, WindowMode, WindowResolution};
+use swarm_core::*;
 
-// —— 常量 ——
-const CELL_SIZE: f32 = 30.0;
-const TICK_SECONDS: f32 = 0.20;
-const GRID_WIDTH: i32 = 20;
-const GRID_HEIGHT: i32 = 20;
-const WINDOW_WIDTH: f32 = GRID_WIDTH as f32 * CELL_SIZE;
-const WINDOW_HEIGHT: f32 = GRID_HEIGHT as f32 * CELL_SIZE;
+const CELL: f32 = 34.0;
+const BOARD_WIDTH: f32 = WIDTH as f32 * CELL;
+const BOARD_HEIGHT: f32 = HEIGHT as f32 * CELL;
+const PANEL_WIDTH: f32 = 330.0;
+const WINDOW_WIDTH: f32 = BOARD_WIDTH + PANEL_WIDTH;
 
-// —— 配色 ——
-const BG_LIGHT: Color = Color::srgb(0.67, 0.85, 0.32);
-const BG_DARK: Color = Color::srgb(0.63, 0.82, 0.29);
-const HEAD_COLOR: Color = Color::srgb(0.20, 0.28, 0.80);
-const BODY_COLOR: Color = Color::srgb(0.30, 0.42, 0.90);
-const FOOD_COLOR: Color = Color::srgb(0.90, 0.25, 0.25);
+const BG: Color = Color::srgb(0.025, 0.045, 0.09);
+const SKY_TILE: Color = Color::srgb(0.055, 0.095, 0.16);
+const WALL: Color = Color::srgb(0.16, 0.22, 0.27);
+const AZURE: Color = Color::srgb(0.18, 0.72, 1.0);
+const AMBER: Color = Color::srgb(1.0, 0.58, 0.16);
+const CRYSTAL: Color = Color::srgb(0.62, 0.35, 1.0);
+const MUTED: Color = Color::srgb(0.52, 0.62, 0.72);
 
-const SPRITE_INSET: f32 = 4.0;
-
-// —— 方向 ——
-#[derive(Clone, Copy, PartialEq)]
-enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-impl Direction {
-    fn as_ivec(self) -> IVec2 {
-        match self {
-            Direction::Up => IVec2::new(0, 1),
-            Direction::Down => IVec2::new(0, -1),
-            Direction::Left => IVec2::new(-1, 0),
-            Direction::Right => IVec2::new(1, 0),
-        }
-    }
-    fn opposite(self) -> Direction {
-        match self {
-            Direction::Up => Direction::Down,
-            Direction::Down => Direction::Up,
-            Direction::Left => Direction::Right,
-            Direction::Right => Direction::Left,
-        }
-    }
-}
-
-// —— 组件 ——
-#[derive(Component)]
-struct SnakePart;
-
-#[derive(Component)]
-struct Food;
-
-#[derive(Component, Clone, Copy)]
-struct GridPos(IVec2);
-
-#[derive(Component, Clone, Copy)]
-struct PrevGridPos(IVec2);
-
-/// 标记：这是分数文本，供 UI 更新系统定位
-#[derive(Component)]
-struct ScoreText;
-
-// —— 资源 ——
 #[derive(Resource)]
-struct MoveTimer(Timer);
-
-#[derive(Resource, Default)]
-struct Score(u32);
-
-#[derive(Resource, PartialEq, Eq, Clone, Copy)]
-enum GameState {
-    Playing,
-    GameOver,
+struct MatchState {
+    simulation: Simulation,
+    paused: bool,
+    intro: bool,
+    guided: bool,
+    view_team: Option<Team>,
+    speed: usize,
+    seed: u64,
+    accumulator: f32,
 }
 
 #[derive(Resource)]
-struct Snake {
-    body: Vec<Entity>,
-    direction: Direction,
-    pending: Option<Direction>,
-    pending_grow: bool,
+struct UiFont(Handle<Font>);
+
+#[derive(Component)] struct WorldVisual;
+#[derive(Component)] struct DroneVisual(Team, usize);
+#[derive(Component)] struct DroneLabel(Team, usize);
+#[derive(Component)] struct CrystalVisual(Pos);
+#[derive(Component)] struct TargetVisual(Team, usize);
+#[derive(Component)] struct FogVisual(Pos);
+#[derive(Component)] struct ScoreText;
+#[derive(Component)] struct StatusText;
+#[derive(Component)] struct FleetText;
+#[derive(Component)] struct EventText;
+#[derive(Component)] struct ProgressFill;
+#[derive(Component)] struct EndOverlay;
+#[derive(Component)] struct EndText;
+#[derive(Component)] struct IntroOverlay;
+
+fn grid_translation(pos: Pos, z: f32) -> Vec3 {
+    let x = -WINDOW_WIDTH / 2.0 + (pos.x as f32 + 0.5) * CELL;
+    let y = -BOARD_HEIGHT / 2.0 + (pos.y as f32 + 0.5) * CELL;
+    Vec3::new(x, y, z)
 }
 
-// —— 消息（Bevy 0.19 里 Event 更名为 Message，强调"数据流"而非回调）——
-/// 蛇头刚吃到食物。多个订阅者可以并行处理：加长、加分、生成新食物、播音效等。
-#[derive(Message)]
-struct AteFoodEvent {
-    food_entity: Entity,
-    /// 被吃位置——目前未订阅，留给以后的粒子特效/音效订阅者用
-    #[allow(dead_code)]
-    at: IVec2,
+fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+    commands.spawn((Camera2d, Camera { clear_color: ClearColorConfig::Custom(BG), ..default() }));
+    commands.insert_resource(UiFont(assets.load("Songti.ttf")));
+    let simulation = Simulation::new(42);
+    spawn_world(&mut commands, &simulation);
+    spawn_ui(&mut commands);
+    commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
 }
 
-/// 蛇死亡:撞墙或撞自己。订阅者处理状态切换、UI 更新、播音效等。
-#[derive(Message, Default)]
-struct GameOverEvent;
-
-// —— 工具函数 ——
-fn grid_to_pixel(pos: IVec2) -> Vec3 {
-    let x = (pos.x as f32 - GRID_WIDTH as f32 / 2.0 + 0.5) * CELL_SIZE;
-    let y = (pos.y as f32 - GRID_HEIGHT as f32 / 2.0 + 0.5) * CELL_SIZE;
-    Vec3::new(x, y, 0.0)
-}
-
-fn in_bounds(pos: IVec2) -> bool {
-    pos.x >= 0 && pos.x < GRID_WIDTH && pos.y >= 0 && pos.y < GRID_HEIGHT
-}
-
-fn random_empty_cell(occupied: &[IVec2]) -> IVec2 {
-    loop {
-        let pos = IVec2::new(
-            random_range(0..GRID_WIDTH),
-            random_range(0..GRID_HEIGHT),
-        );
-        if !occupied.contains(&pos) {
-            return pos;
-        }
-    }
-}
-
-fn spawn_snake_part(commands: &mut Commands, pos: IVec2, color: Color) -> Entity {
-    commands
-        .spawn((
-            SnakePart,
-            GridPos(pos),
-            PrevGridPos(pos),
-            Sprite::from_color(color, Vec2::splat(CELL_SIZE - SPRITE_INSET)),
-            Transform::from_translation(grid_to_pixel(pos)),
-        ))
-        .id()
-}
-
-fn spawn_food(commands: &mut Commands, pos: IVec2) {
-    commands.spawn((
-        Food,
-        GridPos(pos),
-        Sprite::from_color(FOOD_COLOR, Vec2::splat(CELL_SIZE - SPRITE_INSET - 2.0)),
-        Transform::from_translation(grid_to_pixel(pos)),
-    ));
-}
-
-fn spawn_initial_snake(commands: &mut Commands) -> (Vec<Entity>, Vec<IVec2>) {
-    let head = IVec2::new(GRID_WIDTH / 2, GRID_HEIGHT / 2);
-    let positions = vec![head, head - IVec2::new(1, 0), head - IVec2::new(2, 0)];
-    let mut entities = Vec::with_capacity(positions.len());
-    for (i, &pos) in positions.iter().enumerate() {
-        let color = if i == 0 { HEAD_COLOR } else { BODY_COLOR };
-        entities.push(spawn_snake_part(commands, pos, color));
-    }
-    (entities, positions)
-}
-
-fn set_window_title(window: &mut Window, state: GameState) {
-    window.title = match state {
-        GameState::Playing => "Bevy Snake".to_string(),
-        GameState::GameOver => "Bevy Snake — Game Over (press R to restart)".to_string(),
-    };
-}
-
-// —— Startup ——
-fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
-
-    // 棋盘背景
-    for x in 0..GRID_WIDTH {
-        for y in 0..GRID_HEIGHT {
-            let pos = IVec2::new(x, y);
-            let color = if (x + y) % 2 == 0 { BG_LIGHT } else { BG_DARK };
-            let px = grid_to_pixel(pos);
+fn spawn_world(commands: &mut Commands, sim: &Simulation) {
+    for x in 0..WIDTH { for y in 0..HEIGHT {
+        let p = Pos::new(x, y);
+        let color = if sim.walls.contains(&p) { WALL } else { SKY_TILE };
+        let size = if sim.walls.contains(&p) { CELL - 3.0 } else { CELL - 1.0 };
+        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::splat(size)), Transform::from_translation(grid_translation(p, 0.0))));
+    }}
+    // Go-style coordinates on all four edges stay above the fog. The board is
+    // 24 cells wide, so columns run A–X and rows run 0–15.
+    for x in 0..WIDTH {
+        let label = char::from_u32(u32::from(b'A') + x as u32).unwrap_or('?').to_string();
+        for y in [0, HEIGHT - 1] {
+            let mut position = grid_translation(Pos::new(x, y), 11.0);
+            position.y += if y == 0 { -CELL * 0.33 } else { CELL * 0.33 };
             commands.spawn((
-                Sprite::from_color(color, Vec2::splat(CELL_SIZE)),
-                Transform::from_xyz(px.x, px.y, -1.0),
+                WorldVisual,
+                Text2d::new(label.clone()),
+                TextFont::from_font_size(10.0),
+                TextColor(Color::srgba(0.78, 0.88, 0.98, 0.78)),
+                Transform::from_translation(position),
             ));
         }
     }
+    for y in 0..HEIGHT {
+        for x in [0, WIDTH - 1] {
+            let mut position = grid_translation(Pos::new(x, y), 11.0);
+            position.x += if x == 0 { -CELL * 0.31 } else { CELL * 0.31 };
+            commands.spawn((
+                WorldVisual,
+                Text2d::new(y.to_string()),
+                TextFont::from_font_size(9.0),
+                TextColor(Color::srgba(0.78, 0.88, 0.98, 0.78)),
+                Transform::from_translation(position),
+            ));
+        }
+    }
+    for team in Team::ALL {
+        let color = if team == Team::Azure { AZURE } else { AMBER };
+        commands.spawn((WorldVisual, Sprite::from_color(color.with_alpha(0.32), Vec2::splat(CELL * 1.65)), Transform::from_translation(grid_translation(sim.bases[team.index()], 1.0))));
+        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::new(CELL * 0.72, CELL * 0.18)), Transform::from_translation(grid_translation(sim.bases[team.index()], 2.0))));
+    }
+    for crystal in &sim.crystals {
+        commands.spawn((WorldVisual, CrystalVisual(crystal.position), Sprite::from_color(CRYSTAL, Vec2::splat(CELL * 0.42)), Transform { translation: grid_translation(crystal.position, 3.0), rotation: Quat::from_rotation_z(0.785), ..default() }));
+    }
+    for drone in &sim.drones {
+        let color = if drone.team == Team::Azure { AZURE } else { AMBER };
+        commands.spawn((WorldVisual, TargetVisual(drone.team, drone.id), Sprite::from_color(color.with_alpha(0.18), Vec2::splat(CELL * 0.72)), Transform::from_translation(grid_translation(drone.position, 2.5)), Visibility::Hidden));
+        commands.spawn((WorldVisual, DroneVisual(drone.team, drone.id), Sprite::from_color(color, Vec2::new(CELL * 0.66, CELL * 0.52)), Transform::from_translation(grid_translation(drone.position, 5.0))));
+        let label = format!("{}{}", if drone.team == Team::Azure { "A" } else { "B" }, drone.id + 1);
+        commands.spawn((
+            WorldVisual,
+            DroneLabel(drone.team, drone.id),
+            Text2d::new(label),
+            TextFont::from_font_size(11.0),
+            TextColor(Color::srgb(0.97, 0.99, 1.0)),
+            Transform::from_translation(grid_translation(drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0)),
+        ));
+    }
+    for x in 0..WIDTH { for y in 0..HEIGHT {
+        let p = Pos::new(x, y);
+        commands.spawn((WorldVisual, FogVisual(p), Sprite::from_color(Color::srgba(0.005, 0.012, 0.035, 0.94), Vec2::splat(CELL)), Transform::from_translation(grid_translation(p, 10.0)), Visibility::Hidden));
+    }}
+}
 
-    // 初始蛇
-    let (entities, positions) = spawn_initial_snake(&mut commands);
-    commands.insert_resource(Snake {
-        body: entities,
-        direction: Direction::Right,
-        pending: None,
-        pending_grow: false,
+fn text_style(size: f32, color: Color) -> (TextFont, TextColor) { (TextFont::from_font_size(size), TextColor(color)) }
+
+fn spawn_ui(commands: &mut Commands) {
+    commands.spawn((Node {
+        position_type: PositionType::Absolute, right: Val::Px(0.0), top: Val::Px(0.0),
+        width: Val::Px(PANEL_WIDTH), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(22.0)),
+        flex_direction: FlexDirection::Column, row_gap: Val::Px(13.0), ..default()
+    }, BackgroundColor(Color::srgb(0.035, 0.06, 0.105)))).with_children(|p| {
+        p.spawn((Text::new("SWARM SPACE"), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
+        p.spawn((Text::new("Floating Isles\nLogistics Duel"), text_style(29.0, Color::WHITE).0, text_style(29.0, Color::WHITE).1));
+        p.spawn((Text::new("HOW TO READ THE MAP"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(6.0)), ..default() }));
+        p.spawn((Text::new("◆ crystal   ◼ wall   ● base\nBLUE = Greedy   ORANGE = Explorer\nGlobal fog: black unknown · blue/orange team intel · violet shared"), text_style(13.0, Color::srgb(0.72, 0.82, 0.92)).0, text_style(13.0, Color::srgb(0.72, 0.82, 0.92)).1));
+        p.spawn((ScoreText, Text::new(""), text_style(26.0, Color::WHITE).0, text_style(26.0, Color::WHITE).1));
+        p.spawn((Node { width: Val::Percent(100.0), height: Val::Px(6.0), ..default() }, BackgroundColor(Color::srgb(0.10, 0.15, 0.22)))).with_children(|bar| {
+            bar.spawn((ProgressFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(AZURE)));
+        });
+        p.spawn((StatusText, Text::new(""), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
+        p.spawn((Text::new("FLEET TELEMETRY"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(8.0)), ..default() }));
+        p.spawn((FleetText, Text::new(""), text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).0, text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).1));
+        p.spawn(Node { flex_grow: 1.0, ..default() });
+        p.spawn((EventText, Text::new(""), text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).0, text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).1));
+        p.spawn((Text::new("SPACE pause  N step  T teaching mode\nV view  1/2/3 speed  R replay  G new map  F11 fullscreen"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1));
     });
 
-    // 食物
-    spawn_food(&mut commands, random_empty_cell(&positions));
+    commands.spawn((EndOverlay, Node {
+        position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
+        width: Val::Px(BOARD_WIDTH), height: Val::Percent(100.0), justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center, ..default()
+    }, BackgroundColor(Color::srgba(0.015, 0.025, 0.055, 0.76)), Visibility::Hidden)).with_children(|p| {
+        p.spawn((EndText, Text::new(""), text_style(38.0, Color::WHITE).0, text_style(38.0, Color::WHITE).1, TextLayout::justify(Justify::Center)));
+    });
 
-    // 分数 UI:右上角文本
-    commands.spawn((
-        ScoreText,
-        Text::new("Score: 0"),
-        TextFont {
-            font_size: FontSize::Px(22.0),
-            ..default()
-        },
-        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            right: Val::Px(14.0),
-            ..default()
-        },
-    ));
+    commands.spawn((IntroOverlay, Node {
+        position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
+        width: Val::Px(BOARD_WIDTH), height: Val::Percent(100.0), justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center, ..default()
+    }, BackgroundColor(Color::srgba(0.015, 0.025, 0.055, 0.92)))).with_children(|p| {
+        p.spawn((Node { width: Val::Px(470.0), padding: UiRect::all(Val::Px(30.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(14.0), ..default() }, BackgroundColor(Color::srgb(0.055, 0.09, 0.15)))).with_children(|card| {
+            card.spawn((Text::new("漂浮群岛物流战"), text_style(32.0, Color::WHITE).0, text_style(32.0, Color::WHITE).1));
+            card.spawn((Text::new("两支无人机舰队争夺天空晶体。\n300 回合内，把更多能量运回基地的一方获胜。"), text_style(17.0, Color::srgb(0.82, 0.89, 0.96)).0, text_style(17.0, Color::srgb(0.82, 0.89, 0.96)).1));
+            card.spawn((Text::new("蓝队：Greedy Bot，优先最近的已知晶体\n橙队：Explorer Bot，一架侦察、两架分工运输\n每架无人机只能看到附近 5 格，发现的信息会共享。"), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
+            card.spawn((Text::new("观察顺序：找到晶体 → 采集 → 满载返航 → 交付"), text_style(15.0, Color::srgb(0.65, 0.95, 0.8)).0, text_style(15.0, Color::srgb(0.65, 0.95, 0.8)).1));
+            card.spawn((Text::new("按 Enter 或 Space 开始比赛"), text_style(19.0, Color::WHITE).0, text_style(19.0, Color::WHITE).1));
+        });
+    });
 }
 
-// —— 系统:读键盘 ——
-fn read_input(
+fn controls(
     keys: Res<ButtonInput<KeyCode>>,
-    mut snake: ResMut<Snake>,
-    mut timer: ResMut<MoveTimer>,
-) {
-    let new_dir = if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
-        Some(Direction::Up)
-    } else if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
-        Some(Direction::Down)
-    } else if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA) {
-        Some(Direction::Left)
-    } else if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD) {
-        Some(Direction::Right)
-    } else {
-        None
-    };
-
-    if let Some(dir) = new_dir
-        && dir != snake.direction
-        && dir != snake.direction.opposite()
-    {
-        snake.pending = Some(dir);
-        // "eager input"：让 tick 立刻发生，消除按键到响应的延迟
-        // 只在还有一段时间才到 tick 时才提前，避免刚好在 tick 边缘重复触发
-        let remaining = timer.0.remaining_secs();
-        if remaining > TICK_SECONDS * 0.5 {
-            let duration = timer.0.duration();
-            timer.0.set_elapsed(duration);
-        }
-    }
-}
-
-// —— 系统:到 tick 时前推整条蛇；碰撞则发出 GameOverEvent ——
-fn tick_snake(
-    time: Res<Time>,
-    mut timer: ResMut<MoveTimer>,
+    mut state: ResMut<MatchState>,
     mut commands: Commands,
-    mut snake: ResMut<Snake>,
-    mut game_over: MessageWriter<GameOverEvent>,
-    mut query: Query<(&mut GridPos, &mut PrevGridPos), With<SnakePart>>,
+    visuals: Query<Entity, With<WorldVisual>>,
+    mut windows: Query<&mut Window>,
 ) {
-    if !timer.0.tick(time.delta()).just_finished() {
-        return;
-    }
-
-    if let Some(dir) = snake.pending.take() {
-        snake.direction = dir;
-    }
-
-    let positions: Vec<IVec2> = snake
-        .body
-        .iter()
-        .filter_map(|&e| query.get(e).ok().map(|(p, _)| p.0))
-        .collect();
-    if positions.is_empty() {
-        return;
-    }
-
-    let new_head = positions[0] + snake.direction.as_ivec();
-    let old_tail = *positions.last().unwrap();
-
-    // —— 碰撞检测 ——
-    // 撞墙
-    let out_of_bounds = !in_bounds(new_head);
-    // 撞自己：新头位置和"移动后依然存在的身体段"重合
-    //   如果不生长：尾巴会让位，所以只查 positions[..len-1]
-    //   如果生长：尾巴不让位，要查所有
-    let will_hit_self = if snake.pending_grow {
-        positions.contains(&new_head)
-    } else {
-        positions[..positions.len() - 1].contains(&new_head)
-    };
-
-    if out_of_bounds || will_hit_self {
-        game_over.write(GameOverEvent);
-        return;
-    }
-
-    // —— 前推所有节 ——
-    for (i, &entity) in snake.body.iter().enumerate() {
-        if let Ok((mut pos, mut prev)) = query.get_mut(entity) {
-            prev.0 = positions[i];
-            pos.0 = if i == 0 { new_head } else { positions[i - 1] };
-        }
-    }
-
-    // —— 生长 ——
-    if snake.pending_grow {
-        snake.pending_grow = false;
-        let entity = spawn_snake_part(&mut commands, old_tail, BODY_COLOR);
-        snake.body.push(entity);
-    }
-}
-
-// —— 系统:检测吃食物,只发事件 ——
-fn detect_food_eaten(
-    snake: Res<Snake>,
-    pos_query: Query<&GridPos, With<SnakePart>>,
-    food_query: Query<(Entity, &GridPos), With<Food>>,
-    mut events: MessageWriter<AteFoodEvent>,
-) {
-    let Some(&head_entity) = snake.body.first() else { return };
-    let Ok(head_pos) = pos_query.get(head_entity) else { return };
-    for (food_entity, food_pos) in &food_query {
-        if head_pos.0 == food_pos.0 {
-            events.write(AteFoodEvent {
-                food_entity,
-                at: food_pos.0,
-            });
-        }
-    }
-}
-
-// —— 订阅 AteFoodEvent:蛇准备加长 ——
-fn grow_snake_on_eat(mut events: MessageReader<AteFoodEvent>, mut snake: ResMut<Snake>) {
-    for _ in events.read() {
-        snake.pending_grow = true;
-    }
-}
-
-// —— 订阅 AteFoodEvent:加分 ——
-fn award_score_on_eat(mut events: MessageReader<AteFoodEvent>, mut score: ResMut<Score>) {
-    for _ in events.read() {
-        score.0 += 1;
-    }
-}
-
-// —— 订阅 AteFoodEvent:清除旧食物、生成新食物 ——
-fn respawn_food_on_eat(
-    mut events: MessageReader<AteFoodEvent>,
-    mut commands: Commands,
-    snake: Res<Snake>,
-    pos_query: Query<&GridPos, With<SnakePart>>,
-) {
-    for ev in events.read() {
-        commands.entity(ev.food_entity).despawn();
-        let occupied: Vec<IVec2> = snake
-            .body
-            .iter()
-            .filter_map(|&e| pos_query.get(e).ok().map(|p| p.0))
-            .collect();
-        spawn_food(&mut commands, random_empty_cell(&occupied));
-    }
-}
-
-// —— 订阅 GameOverEvent:切换状态 ——
-fn transition_to_game_over(
-    mut events: MessageReader<GameOverEvent>,
-    mut state: ResMut<GameState>,
-) {
-    for _ in events.read() {
-        *state = GameState::GameOver;
-    }
-}
-
-// —— 订阅 GameOverEvent:更新窗口标题 ——
-fn update_window_on_game_over(
-    mut events: MessageReader<GameOverEvent>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
-) {
-    for _ in events.read() {
+    if keys.just_pressed(KeyCode::F11) {
         if let Ok(mut window) = windows.single_mut() {
-            set_window_title(&mut window, GameState::GameOver);
+            window.mode = match window.mode {
+                WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                _ => WindowMode::Windowed,
+            };
+        }
+    }
+    if state.intro {
+        if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+            state.intro = false;
+            state.paused = false;
+        }
+        return;
+    }
+    if keys.just_pressed(KeyCode::Space) { state.paused = !state.paused; }
+    if keys.just_pressed(KeyCode::KeyT) {
+        state.guided = !state.guided;
+        state.paused = state.guided;
+    }
+    if keys.just_pressed(KeyCode::KeyV) {
+        state.view_team = match state.view_team {
+            None => Some(Team::Azure),
+            Some(Team::Azure) => Some(Team::Amber),
+            Some(Team::Amber) => None,
+        };
+    }
+    if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; }
+    if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
+    if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
+    if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.simulation.step(); state.paused = true; }
+    let restart = keys.just_pressed(KeyCode::KeyR);
+    let regenerate = keys.just_pressed(KeyCode::KeyG);
+    if restart || regenerate {
+        if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
+        for entity in &visuals { commands.entity(entity).despawn(); }
+        state.simulation = Simulation::new(state.seed);
+        state.paused = false;
+        state.intro = false;
+        state.guided = false;
+        state.view_team = None;
+        state.accumulator = 0.0;
+        spawn_world(&mut commands, &state.simulation);
+    }
+}
+
+fn run_match(time: Res<Time>, mut state: ResMut<MatchState>) {
+    if state.intro || state.paused || state.guided || state.simulation.finished { return; }
+    state.accumulator += time.delta_secs();
+    let interval = 0.24 / state.speed as f32;
+    while state.accumulator >= interval {
+        state.accumulator -= interval;
+        state.simulation.step();
+        if state.simulation.finished { break; }
+    }
+}
+
+fn sync_visuals(
+    state: Res<MatchState>,
+    mut visuals: ParamSet<(
+        Query<(&DroneVisual, &mut Transform, &mut Sprite, &mut Visibility)>,
+        Query<(&DroneLabel, &mut Transform, &mut Visibility)>,
+        Query<(&TargetVisual, &mut Transform, &mut Visibility)>,
+        Query<(&CrystalVisual, &mut Visibility)>,
+        Query<(&FogVisual, &mut Sprite, &mut Visibility)>,
+    )>,
+) {
+    let viewed_team = state.view_team;
+    let is_currently_visible = |team: Team, pos: Pos| state.simulation.drones.iter()
+        .filter(|drone| drone.team == team)
+        .any(|drone| drone.position.distance(pos) <= SENSOR_RANGE);
+
+    for (marker, mut transform, mut sprite, mut visibility) in &mut visuals.p0() {
+        if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
+            transform.translation = grid_translation(drone.position, 5.0);
+            let fullness = drone.cargo as f32 / CARGO_CAPACITY as f32;
+            sprite.color = if drone.team == Team::Azure { AZURE } else { AMBER }.mix(&Color::WHITE, fullness * 0.35);
+            *visibility = match viewed_team {
+                Some(team) if drone.team != team && !is_currently_visible(team, drone.position) => Visibility::Hidden,
+                _ => Visibility::Visible,
+            };
+        }
+    }
+    for (marker, mut transform, mut visibility) in &mut visuals.p1() {
+        if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
+            transform.translation = grid_translation(drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0);
+            *visibility = match viewed_team {
+                Some(team) if drone.team != team && !is_currently_visible(team, drone.position) => Visibility::Hidden,
+                _ => Visibility::Visible,
+            };
+        }
+    }
+    for (marker, mut transform, mut visibility) in &mut visuals.p2() {
+        if let Some(target) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1).and_then(|d| d.target) {
+            transform.translation = grid_translation(target, 2.5);
+            *visibility = if viewed_team.map_or(true, |team| team == marker.0) { Visibility::Visible } else { Visibility::Hidden };
+        } else { *visibility = Visibility::Hidden; }
+    }
+    for (marker, mut visibility) in &mut visuals.p3() {
+        let amount = match viewed_team {
+            Some(team) => state.simulation.memories[team.index()].known_crystals.get(&marker.0).copied().unwrap_or(0),
+            None => state.simulation.crystals.iter().find(|c| c.position == marker.0).map_or(0, |c| c.amount),
+        };
+        *visibility = if amount > 0 { Visibility::Visible } else { Visibility::Hidden };
+    }
+    for (marker, mut sprite, mut visibility) in &mut visuals.p4() {
+        let azure_knows = state.simulation.memories[Team::Azure.index()].explored.contains(&marker.0);
+        let amber_knows = state.simulation.memories[Team::Amber.index()].explored.contains(&marker.0);
+        match viewed_team {
+            Some(team) => {
+                *visibility = if state.simulation.memories[team.index()].explored.contains(&marker.0) {
+                    Visibility::Hidden
+                } else {
+                    sprite.color = Color::srgba(0.005, 0.012, 0.035, 0.94);
+                    Visibility::Visible
+                };
+            }
+            None => {
+                // Omniscient mode reveals the terrain but visualises who has
+                // discovered it: dark is unknown to both, violet is shared.
+                let color = match (azure_knows, amber_knows) {
+                    (false, false) => Color::srgba(0.005, 0.012, 0.035, 0.88),
+                    (true, false) => AZURE.with_alpha(0.30),
+                    (false, true) => AMBER.with_alpha(0.30),
+                    (true, true) => Color::srgba(0.62, 0.38, 0.98, 0.12),
+                };
+                sprite.color = color;
+                *visibility = Visibility::Visible;
+            }
         }
     }
 }
 
-// —— 系统:每帧插值 ——
-fn interpolate_visual(
-    timer: Res<MoveTimer>,
-    mut query: Query<(&GridPos, &PrevGridPos, &mut Transform)>,
+fn update_ui(
+    state: Res<MatchState>,
+    mut texts: ParamSet<(
+        Query<&mut Text, With<ScoreText>>,
+        Query<&mut Text, With<StatusText>>,
+        Query<&mut Text, With<FleetText>>,
+        Query<&mut Text, With<EventText>>,
+        Query<&mut Text, With<EndText>>,
+    )>,
+    mut fill: Query<&mut Node, With<ProgressFill>>,
+    mut overlays: ParamSet<(
+        Query<&mut Visibility, With<EndOverlay>>,
+        Query<&mut Visibility, With<IntroOverlay>>,
+    )>,
 ) {
-    let t = (timer.0.elapsed_secs() / timer.0.duration().as_secs_f32()).clamp(0.0, 1.0);
-    for (pos, prev, mut transform) in &mut query {
-        let from = grid_to_pixel(prev.0);
-        let to = grid_to_pixel(pos.0);
-        let lerped = from.lerp(to, t);
-        transform.translation.x = lerped.x;
-        transform.translation.y = lerped.y;
+    let sim = &state.simulation;
+    if let Ok(mut text) = texts.p0().single_mut() { **text = format!("{}  :  {}", sim.scores[0], sim.scores[1]); }
+    if let Ok(mut text) = texts.p1().single_mut() {
+        let remaining: u32 = sim.crystals.iter().map(|crystal| crystal.amount as u32).sum();
+        let view = match state.view_team { None => "OMNISCIENT", Some(Team::Azure) => "AZURE MEMORY", Some(Team::Amber) => "AMBER MEMORY" };
+        **text = format!("AZURE  Greedy Bot       AMBER  Explorer Bot\nTurn {:03} / {}   {}   Speed {}×\nView: {}   Crystals remaining: {}",
+            sim.turn, MAX_TURNS, if state.intro { "READY" } else if sim.finished { "MATCH OVER" } else if state.guided { "TEACHING" } else if state.paused { "PAUSED" } else { "RUNNING" }, state.speed, view, remaining);
+    }
+    let mut lines = Vec::new();
+    for drone in &sim.drones {
+        let glyph = if drone.team == Team::Azure { "A" } else { "B" };
+        let target = drone.target.map_or("—".into(), |p| p.board_label());
+        lines.push(format!("{}{}  {:9}  {}/{}  → {:5}  {}", glyph, drone.id + 1, drone.role.label(), drone.cargo, CARGO_CAPACITY, target, drone.reason));
+    }
+    if let Ok(mut text) = texts.p2().single_mut() { **text = lines.join("\n"); }
+    if let Ok(mut text) = texts.p3().single_mut() {
+        **text = format!("TURN {} DECISIONS\n{}\n\nLATEST EVENT\n{}", sim.turn, sim.turn_explanation, sim.last_event);
+    }
+    if let Ok(mut node) = fill.single_mut() { node.width = Val::Percent(sim.turn as f32 / MAX_TURNS as f32 * 100.0); }
+    let visible = sim.finished;
+    if let Ok(mut value) = overlays.p0().single_mut() { *value = if visible { Visibility::Visible } else { Visibility::Hidden }; }
+    if let Ok(mut value) = overlays.p1().single_mut() { *value = if state.intro { Visibility::Visible } else { Visibility::Hidden }; }
+    if visible { if let Ok(mut text) = texts.p4().single_mut() {
+        let winner = if sim.scores[0] > sim.scores[1] { "AZURE WINS" } else if sim.scores[1] > sim.scores[0] { "AMBER WINS" } else { "DRAW" };
+        **text = format!("{}\n{} : {}\n\nBLUE used nearest-resource greed.\nORANGE used scouting and role assignment.\n\nPress R to replay this map\nPress G for a new map", winner, sim.scores[0], sim.scores[1]);
+    }}
+}
+
+fn apply_ui_font(font: Res<UiFont>, mut texts: Query<&mut TextFont>) {
+    for mut text_font in &mut texts {
+        text_font.font = font.0.clone().into();
     }
 }
 
-// —— 系统:分数变化时刷新 UI 文本 ——
-fn update_score_text(score: Res<Score>, mut query: Query<&mut Text, With<ScoreText>>) {
-    if !score.is_changed() {
-        return;
+fn disable_word_segmentation(mut layouts: Query<&mut TextLayout>) {
+    for mut layout in &mut layouts {
+        layout.linebreak = LineBreak::NoWrap;
     }
-    for mut text in &mut query {
-        text.0 = format!("Score: {}", score.0);
-    }
-}
-
-// —— 系统:游戏结束时按 R 重开 ——
-fn handle_restart(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut commands: Commands,
-    mut snake: ResMut<Snake>,
-    mut state: ResMut<GameState>,
-    mut timer: ResMut<MoveTimer>,
-    mut score: ResMut<Score>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    parts: Query<Entity, With<SnakePart>>,
-    foods: Query<Entity, With<Food>>,
-) {
-    if !keys.just_pressed(KeyCode::KeyR) {
-        return;
-    }
-
-    // 清场
-    for e in &parts {
-        commands.entity(e).despawn();
-    }
-    for e in &foods {
-        commands.entity(e).despawn();
-    }
-
-    // 重建蛇和食物
-    let (entities, positions) = spawn_initial_snake(&mut commands);
-    snake.body = entities;
-    snake.direction = Direction::Right;
-    snake.pending = None;
-    snake.pending_grow = false;
-    spawn_food(&mut commands, random_empty_cell(&positions));
-
-    timer.0.reset();
-    score.0 = 0;
-    *state = GameState::Playing;
-    if let Ok(mut window) = windows.single_mut() {
-        set_window_title(&mut window, GameState::Playing);
-    }
-}
-
-// —— run_if 条件 ——
-fn is_playing(state: Res<GameState>) -> bool {
-    *state == GameState::Playing
-}
-fn is_game_over(state: Res<GameState>) -> bool {
-    *state == GameState::GameOver
 }
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Bevy Snake".to_string(),
-                resolution: WindowResolution::new(WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32),
-                resizable: false,
-                ..default()
-            }),
-            ..default()
-        }))
-        .insert_resource(ClearColor(BG_DARK))
-        .insert_resource(GameState::Playing)
-        .insert_resource(Score::default())
-        .insert_resource(MoveTimer(Timer::from_seconds(
-            TICK_SECONDS,
-            TimerMode::Repeating,
-        )))
-        .add_message::<AteFoodEvent>()
-        .add_message::<GameOverEvent>()
-        .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            (
-                read_input,
-                tick_snake,
-                detect_food_eaten,
-                grow_snake_on_eat,
-                award_score_on_eat,
-                respawn_food_on_eat,
-                transition_to_game_over,
-                update_window_on_game_over,
-            )
-                .chain()
-                .run_if(is_playing),
+        .add_plugins(
+            DefaultPlugins.set(WindowPlugin { primary_window: Some(Window {
+                    title: "Swarm Space — Floating Isles Logistics Duel".into(),
+                    resolution: WindowResolution::new(1280, 720),
+                    resizable: true,
+                    ..default()
+                }), ..default() }),
         )
-        .add_systems(Update, interpolate_visual)
-        .add_systems(Update, update_score_text)
-        .add_systems(Update, handle_restart.run_if(is_game_over))
+        .add_systems(Startup, setup)
+        .add_systems(Update, (controls, run_match, sync_visuals, update_ui, apply_ui_font, disable_word_segmentation).chain())
         .run();
 }
