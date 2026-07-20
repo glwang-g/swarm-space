@@ -5,7 +5,6 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{MonitorSelection, WindowMode, WindowResolution, WindowResized};
 use swarm_core::*;
-use std::sync::{mpsc, Mutex};
 
 const PANEL_WIDTH: f32 = 330.0;
 const MIN_CELL: f32 = 24.0;
@@ -61,20 +60,30 @@ impl BoardLayout {
 struct MiniMapDrag { active: bool }
 
 #[derive(Resource)]
-struct ExperimentLab {
-    visible: bool,
-    selected_drones: usize,
-    max_drones: usize,
-    samples: u64,
-    rows: Vec<BenchmarkRow>,
-    receiver: Option<Mutex<mpsc::Receiver<BenchmarkUpdate>>>,
-    benchmark_status: String,
-    benchmark_progress: Option<(u64, u64)>,
+struct ArenaSetup {
+    drones_per_team: usize,
+    crystal_sites: usize,
+    wall_chance_percent: u32,
 }
 
-enum BenchmarkUpdate {
-    Progress { completed: u64, total: u64 },
-    Finished(Vec<BenchmarkRow>),
+impl Default for ArenaSetup {
+    fn default() -> Self {
+        let scenario = Scenario::default();
+        Self {
+            drones_per_team: scenario.drones_per_team,
+            crystal_sites: scenario.crystal_sites,
+            wall_chance_percent: scenario.wall_chance_percent,
+        }
+    }
+}
+
+impl ArenaSetup {
+    fn scenario(&self) -> Scenario {
+        let mut scenario = Scenario::scaled(self.drones_per_team, [Strategy::Autonomous, Strategy::HybridScout]);
+        scenario.crystal_sites = self.crystal_sites;
+        scenario.wall_chance_percent = self.wall_chance_percent;
+        scenario
+    }
 }
 
 #[derive(Component)] struct WorldVisual;
@@ -91,8 +100,7 @@ enum BenchmarkUpdate {
 #[derive(Component)] struct EndOverlay;
 #[derive(Component)] struct EndText;
 #[derive(Component)] struct IntroOverlay;
-#[derive(Component)] struct LabOverlay;
-#[derive(Component)] struct LabText;
+#[derive(Component)] struct ArenaSetupText;
 #[derive(Component)] struct SidebarScroll;
 #[derive(Component)] struct MapCamera;
 #[derive(Component)] struct MiniMapViewport { scale: f32 }
@@ -126,11 +134,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Windo
     spawn_world(&mut commands, &simulation, layout);
     spawn_ui(&mut commands);
     commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
-    commands.insert_resource(ExperimentLab {
-        visible: false, selected_drones: 3, max_drones: 8, samples: 6, rows: Vec::new(), receiver: None,
-        benchmark_status: "Press B to compare strategies across the selected sample set.".into(),
-        benchmark_progress: None,
-    });
+    commands.insert_resource(ArenaSetup::default());
 }
 
 fn window_size(windows: &Query<&Window>) -> Vec2 {
@@ -331,11 +335,13 @@ fn spawn_ui(commands: &mut Commands) {
             bar.spawn((ProgressFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(AZURE)));
         });
         p.spawn((StatusText, Text::new(""), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
+        p.spawn((Text::new("SCENARIO SETUP"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(8.0)), ..default() }));
+        p.spawn((ArenaSetupText, Text::new(""), text_style(13.0, Color::srgb(0.80, 0.88, 0.96)).0, text_style(13.0, Color::srgb(0.80, 0.88, 0.96)).1));
         p.spawn((Text::new("FLEET TELEMETRY"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(8.0)), ..default() }));
         p.spawn((FleetText, Text::new(""), text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).0, text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).1));
         p.spawn(Node { flex_grow: 1.0, ..default() });
         p.spawn((EventText, Text::new(""), text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).0, text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).1));
-        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nL lab · SPACE pause · N step · V view · 1/2/3 speed\nR replay · G new map · F11 fullscreen"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
+        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nSPACE pause · N step · V view · 1/2/3 speed\nR replay · G new map · F11 fullscreen"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
     });
 
     commands.spawn((EndOverlay, Node {
@@ -360,23 +366,12 @@ fn spawn_ui(commands: &mut Commands) {
         });
     });
 
-    commands.spawn((LabOverlay, Node {
-        position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
-        right: Val::Px(PANEL_WIDTH), bottom: Val::Px(0.0), justify_content: JustifyContent::Center,
-        align_items: AlignItems::Center, ..default()
-    }, BackgroundColor(Color::srgba(0.012, 0.024, 0.055, 0.94)), Visibility::Hidden)).with_children(|p| {
-        p.spawn((Node { width: Val::Px(650.0), padding: UiRect::all(Val::Px(28.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(12.0), ..default() }, BackgroundColor(Color::srgb(0.045, 0.085, 0.145)))).with_children(|card| {
-            card.spawn((Text::new("LEADERSHIP EXPERIMENT LAB"), text_style(25.0, Color::WHITE).0, text_style(25.0, Color::WHITE).1));
-            card.spawn((LabText, Text::new("Preparing benchmark…"), text_style(15.0, Color::srgb(0.82, 0.89, 0.96)).0, text_style(15.0, Color::srgb(0.82, 0.89, 0.96)).1));
-            card.spawn((Text::new("- / + fleet size   Enter restart with selected scenario\n[ / ] benchmark samples   B run comparison table\nL close lab (match stays paused) · Same seeded maps · density-preserving scale"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1));
-        });
-    });
 }
 
 fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<MatchState>,
-    mut lab: ResMut<ExperimentLab>,
+    mut setup: ResMut<ArenaSetup>,
     mut layout: ResMut<BoardLayout>,
     mut commands: Commands,
     visuals: Query<Entity, With<WorldVisual>>,
@@ -409,49 +404,22 @@ fn controls(
             Some(Team::Amber) => None,
         };
     }
-    if keys.just_pressed(KeyCode::KeyL) {
-        lab.visible = !lab.visible;
-        // The lab is a deliberate break in the match. Closing it is not an
-        // implicit resume: Space remains the explicit resume control, while
-        // Enter starts the newly selected scenario.
-        state.paused = true;
-    }
-    if lab.visible && keys.just_pressed(KeyCode::Minus) {
-        lab.selected_drones = lab.selected_drones.saturating_sub(1).max(2);
-    }
-    if lab.visible && keys.just_pressed(KeyCode::Equal) {
-        lab.selected_drones = (lab.selected_drones + 1).min(16);
-    }
-    if lab.visible && keys.just_pressed(KeyCode::BracketLeft) {
-        lab.samples = lab.samples.saturating_sub(1).max(2);
-    }
-    if lab.visible && keys.just_pressed(KeyCode::BracketRight) {
-        lab.samples = (lab.samples + 1).min(24);
-    }
-    if lab.visible && keys.just_pressed(KeyCode::KeyB) { launch_benchmark(&mut lab); }
-    if lab.visible && keys.just_pressed(KeyCode::Enter) {
-        let scenario = Scenario::scaled(lab.selected_drones, [Strategy::Autonomous, Strategy::HybridScout]);
-        for entity in &visuals { commands.entity(entity).despawn(); }
-        state.simulation = Simulation::with_scenario(state.seed, scenario);
-        let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
-        *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
-        state.paused = false;
-        state.guided = false;
-        state.view_team = None;
-        state.accumulator = 0.0;
-        lab.visible = false;
-        spawn_world(&mut commands, &state.simulation, *layout);
-    }
+    if keys.just_pressed(KeyCode::BracketLeft) { setup.drones_per_team = setup.drones_per_team.saturating_sub(1).max(2); }
+    if keys.just_pressed(KeyCode::BracketRight) { setup.drones_per_team = (setup.drones_per_team + 1).min(16); }
+    if keys.just_pressed(KeyCode::Comma) { setup.crystal_sites = setup.crystal_sites.saturating_sub(2).max(5); }
+    if keys.just_pressed(KeyCode::Period) { setup.crystal_sites = (setup.crystal_sites + 2).min(81); }
+    if keys.just_pressed(KeyCode::Semicolon) { setup.wall_chance_percent = setup.wall_chance_percent.saturating_sub(2); }
+    if keys.just_pressed(KeyCode::Quote) { setup.wall_chance_percent = (setup.wall_chance_percent + 2).min(35); }
     if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; }
     if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
     if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
     if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.simulation.step(); state.paused = true; }
-    let restart = keys.just_pressed(KeyCode::KeyR);
+    let restart = keys.just_pressed(KeyCode::KeyR) || keys.just_pressed(KeyCode::Enter);
     let regenerate = keys.just_pressed(KeyCode::KeyG);
     if restart || regenerate {
         if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
         for entity in &visuals { commands.entity(entity).despawn(); }
-        state.simulation = Simulation::new(state.seed);
+        state.simulation = Simulation::with_scenario(state.seed, setup.scenario());
         let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
         *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
         state.paused = false;
@@ -463,6 +431,7 @@ fn controls(
     }
 }
 
+#[cfg(any())]
 fn launch_benchmark(lab: &mut ExperimentLab) {
     if lab.receiver.is_some() {
         lab.benchmark_status = "Benchmark is already running — please wait for this sample set.".into();
@@ -483,6 +452,7 @@ fn launch_benchmark(lab: &mut ExperimentLab) {
     });
 }
 
+#[cfg(any())]
 fn update_lab(mut lab: ResMut<ExperimentLab>, mut overlays: Query<&mut Visibility, With<LabOverlay>>, mut text: Query<&mut Text, With<LabText>>) {
     let mut updates = Vec::new();
     if let Some(receiver) = &lab.receiver {
@@ -533,6 +503,16 @@ fn update_lab(mut lab: ResMut<ExperimentLab>, mut overlays: Query<&mut Visibilit
         }
         lines.push("\nEach cell is B score difference / B win rate. Every seed runs both left/right assignments.".into());
         **value = lines.join("\n");
+    }
+}
+
+fn update_arena_setup(setup: Res<ArenaSetup>, mut text: Query<&mut Text, With<ArenaSetupText>>) {
+    if !setup.is_changed() { return; }
+    if let Ok(mut text) = text.single_mut() {
+        **text = format!(
+            "公平镜像场景（双方相同）\n[ / ] 每队无人机：{}\n, / . 晶体点：{}\n; / ' 障碍密度：{}%\nEnter 应用设置并重新开局",
+            setup.drones_per_team, setup.crystal_sites, setup.wall_chance_percent,
+        );
     }
 }
 
@@ -832,6 +812,6 @@ fn main() {
                 }), ..default() }),
         )
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_lab, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
+        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_arena_setup, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
         .run();
 }
