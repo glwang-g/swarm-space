@@ -6,6 +6,14 @@
 
 这是一个 Battlecode 风格的短局“群智对决”原型，同时预留了未来扩展为 Screeps 风格持久世界的模拟边界。
 
+## Bot arena boundary
+
+规则引擎与策略已分离：每架无人机都由一个 `Bot` 实例根据受限的
+`Observation` 返回单步 `Intent`；引擎才是唯一能裁决移动、采集、交付和
+交通冲突的一方。内置 AUTO / SCOUT / HYBRID 也通过同一接口运行，不享有
+读取全局地图的特权。自定义 Rust bot 的最小接口与示例见
+[docs/bot-api.md](docs/bot-api.md)。
+
 ## Run
 
 ```bash

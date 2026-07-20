@@ -3,4 +3,6 @@
 //! This transitional include keeps the core implementation in one source file
 //! while the Bevy viewer is migrated away from it. The public API is now owned
 //! by this crate and can later be compiled for WASM or a headless server.
+pub mod bots;
+
 include!("../../../src/simulation.rs");

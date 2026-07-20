@@ -1,12 +1,138 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use crate::bots::{BaselineBot, Bot};
 
 pub const WIDTH: i32 = 24;
 pub const HEIGHT: i32 = 16;
 pub const MAX_TURNS: u32 = 300;
 pub const SENSOR_RANGE: i32 = 5;
 pub const CARGO_CAPACITY: u8 = 3;
-const SCOUT_SOURCE_GOAL: usize = 2;
-const SCOUT_COVERAGE_LIMIT_PERCENT: usize = 35;
+// Legacy internal helpers are retained until the next source-file split; the
+// active built-in bots define the same policy in `bots.rs`.
+#[allow(dead_code)] const SCOUT_SOURCE_GOAL: usize = 2;
+#[allow(dead_code)] const SCOUT_COVERAGE_LIMIT_PERCENT: usize = 35;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    Autonomous,
+    DedicatedScout,
+    HybridScout,
+}
+
+impl Strategy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Autonomous => "Autonomous",
+            Self::DedicatedScout => "Dedicated scout",
+            Self::HybridScout => "Hybrid scout",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Scenario {
+    pub width: i32,
+    pub height: i32,
+    pub drones_per_team: usize,
+    pub wall_chance_percent: u32,
+    pub crystal_sites: usize,
+    pub max_turns: u32,
+    pub strategies: [Strategy; 2],
+}
+
+impl Default for Scenario {
+    fn default() -> Self {
+        Self {
+            width: WIDTH,
+            height: HEIGHT,
+            drones_per_team: 3,
+            wall_chance_percent: 16,
+            crystal_sites: 9,
+            max_turns: MAX_TURNS,
+            strategies: [Strategy::Autonomous, Strategy::HybridScout],
+        }
+    }
+}
+
+impl Scenario {
+    pub fn scaled(drones_per_team: usize, strategies: [Strategy; 2]) -> Self {
+        let drones_per_team = drones_per_team.clamp(2, 16);
+        let linear = (drones_per_team as f32 / 3.0).sqrt();
+        let width = ((WIDTH as f32 * linear).round() as i32).max(16);
+        let height = ((HEIGHT as f32 * linear).round() as i32).max(12);
+        let area_scale = width as f32 * height as f32 / (WIDTH * HEIGHT) as f32;
+        Self {
+            width,
+            height,
+            drones_per_team,
+            wall_chance_percent: 16,
+            crystal_sites: ((9.0 * area_scale).round() as usize).max(5),
+            max_turns: (MAX_TURNS as f32 * linear).round() as u32,
+            strategies,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkRow {
+    pub drones_per_team: usize,
+    pub dedicated_delta: f32,
+    pub dedicated_win_rate: f32,
+    pub hybrid_delta: f32,
+    pub hybrid_win_rate: f32,
+}
+
+pub fn benchmark_leadership(max_drones: usize, seeds: u64) -> Vec<BenchmarkRow> {
+    benchmark_leadership_with_progress(max_drones, seeds, |_, _| {})
+}
+
+/// Runs the same AB experiment as [`benchmark_leadership`] and reports after
+/// every simulated match. The callback is deliberately small so the UI can
+/// update a progress indicator without putting simulation work on its thread.
+pub fn benchmark_leadership_with_progress<F: FnMut(u64, u64)>(
+    max_drones: usize,
+    seeds: u64,
+    mut progress: F,
+) -> Vec<BenchmarkRow> {
+    let max_drones = max_drones.clamp(2, 16);
+    let total = (max_drones as u64 - 1) * seeds * 4;
+    let mut completed = 0_u64;
+    (2..=max_drones.clamp(2, 16)).map(|drones_per_team| {
+        let mut evaluate = |strategy| {
+            let mut contender_total = 0_i32;
+            let mut autonomous_total = 0_i32;
+            let mut wins = 0_u32;
+            for seed in 0..seeds {
+                // Run both left/right assignments. This protects the comparison
+                // against any residual asymmetry in a generated map.
+                for strategies in [[Strategy::Autonomous, strategy], [strategy, Strategy::Autonomous]] {
+                    let mut sim = Simulation::with_scenario(seed, Scenario::scaled(drones_per_team, strategies));
+                    while !sim.finished { sim.step(); }
+                    completed += 1;
+                    progress(completed, total);
+                    let (contender, autonomous) = if strategies[0] == strategy {
+                        (sim.scores[0], sim.scores[1])
+                    } else {
+                        (sim.scores[1], sim.scores[0])
+                    };
+                    contender_total += contender as i32;
+                    autonomous_total += autonomous as i32;
+                    wins += u32::from(contender > autonomous);
+                }
+            }
+            let rounds = (seeds * 2) as f32;
+            ((contender_total - autonomous_total) as f32 / rounds, wins as f32 / rounds * 100.0)
+        };
+        let (dedicated_delta, dedicated_win_rate) = evaluate(Strategy::DedicatedScout);
+        let (hybrid_delta, hybrid_win_rate) = evaluate(Strategy::HybridScout);
+        BenchmarkRow {
+            drones_per_team,
+            dedicated_delta,
+            dedicated_win_rate,
+            hybrid_delta,
+            hybrid_win_rate,
+        }
+    }).collect()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Pos {
@@ -20,10 +146,16 @@ impl Pos {
         (self.x - other.x).abs() + (self.y - other.y).abs()
     }
     pub fn board_label(self) -> String {
-        let column = char::from_u32(u32::from(b'A') + self.x as u32).unwrap_or('?');
+        let mut value = self.x + 1;
+        let mut column = String::new();
+        while value > 0 {
+            let digit = ((value - 1) % 26) as u8;
+            column.insert(0, char::from(b'A' + digit));
+            value = (value - 1) / 26;
+        }
         format!("{column}{}", self.y)
     }
-    fn neighbors(self) -> [Self; 4] {
+    pub fn neighbors(self) -> [Self; 4] {
         [
             Self::new(self.x + 1, self.y),
             Self::new(self.x - 1, self.y),
@@ -59,7 +191,7 @@ pub struct Drone {
     pub cargo: u8,
     pub role: Role,
     pub target: Option<Pos>,
-    pub reason: &'static str,
+    pub reason: String,
     /// A movement request persists while the drone is waiting for the same cell.
     /// It provides deterministic, starvation-free traffic priority.
     move_request: Option<Pos>,
@@ -75,17 +207,67 @@ pub struct Crystal {
     pub amount: u8,
 }
 
+/// The only authority a bot has over the arena for a turn. The engine checks
+/// adjacency, passability, cargo rules, and simultaneous traffic afterwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action { Move(Pos), Harvest, Deposit, Wait }
+pub enum Intent { Move(Pos), Harvest, Deposit, Wait }
 
-#[derive(Clone, Debug, Default)]
-pub struct TeamMemory {
+// Kept temporarily for private legacy helpers below while the renderer-facing
+// simulation file is migrated; the active decision path uses `Intent` through
+// `Bot::decide` above.
+#[allow(dead_code)] type Action = Intent;
+
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub intent: Intent,
+    pub role: Role,
+    pub target: Option<Pos>,
+    pub reason: &'static str,
+}
+
+impl Decision {
+    pub const fn new(intent: Intent, role: Role, target: Option<Pos>, reason: &'static str) -> Self {
+        Self { intent, role, target, reason }
+    }
+}
+
+/// Information available to one bot at decision time. Hidden world state is
+/// deliberately absent: a bot sees its team's shared discoveries, not the
+/// authoritative terrain, untouched crystals, or opponent positions.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    pub turn: u32,
+    pub width: i32,
+    pub height: i32,
+    pub me: DroneView,
+    pub base: Pos,
+    pub allies: Vec<DroneView>,
     pub explored: HashSet<Pos>,
+    pub known_walls: HashSet<Pos>,
     pub known_crystals: HashMap<Pos, u8>,
 }
 
 #[derive(Clone, Debug)]
+pub struct DroneView {
+    pub id: usize,
+    pub team: Team,
+    pub position: Pos,
+    pub cargo: u8,
+    pub target: Option<Pos>,
+    pub blocked_turns: u32,
+    pub last_position: Option<Pos>,
+    pub yield_cooldown: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TeamMemory {
+    pub explored: HashSet<Pos>,
+    pub known_walls: HashSet<Pos>,
+    pub known_crystals: HashMap<Pos, u8>,
+}
+
 pub struct Simulation {
+    pub scenario: Scenario,
     pub turn: u32,
     pub scores: [u32; 2],
     pub bases: [Pos; 2],
@@ -96,21 +278,38 @@ pub struct Simulation {
     pub finished: bool,
     pub last_event: String,
     pub turn_explanation: String,
+    bots: Vec<Box<dyn Bot>>,
 }
 
 impl Simulation {
     pub fn new(seed: u64) -> Self {
-        let bases = [Pos::new(1, HEIGHT / 2), Pos::new(WIDTH - 2, HEIGHT / 2)];
+        Self::with_scenario(seed, Scenario::default())
+    }
+
+    pub fn with_scenario(seed: u64, scenario: Scenario) -> Self {
+        let strategies = scenario.strategies;
+        Self::with_bot_factory(seed, scenario, move |team, _id| {
+            Box::new(BaselineBot::new(strategies[team.index()]))
+        })
+    }
+
+    /// Creates a match with one isolated bot instance per drone. This is the
+    /// Battlecode-style entry point for future user supplied strategies.
+    pub fn with_bot_factory<F>(seed: u64, scenario: Scenario, mut factory: F) -> Self
+    where
+        F: FnMut(Team, usize) -> Box<dyn Bot>,
+    {
+        let bases = [Pos::new(1, scenario.height / 2), Pos::new(scenario.width - 2, scenario.height / 2)];
         let mut rng = Lcg::new(seed);
         let mut walls = HashSet::new();
 
         // Mirrored cloud gaps make each seed fair while keeping every match distinct.
-        for x in 3..WIDTH / 2 {
-            for y in 1..HEIGHT - 1 {
-                if rng.chance(16) {
+        for x in 3..scenario.width / 2 {
+            for y in 1..scenario.height - 1 {
+                if rng.chance(scenario.wall_chance_percent.into()) {
                     let a = Pos::new(x, y);
-                    let b = Pos::new(WIDTH - 1 - x, HEIGHT - 1 - y);
-                    if a.distance(bases[0]) > 3 && b.distance(bases[1]) > 3 {
+                    let b = Pos::new(scenario.width - 1 - x, scenario.height - 1 - y);
+                    if a.distance(bases[0]) > scenario.drones_per_team as i32 / 2 + 3 && b.distance(bases[1]) > scenario.drones_per_team as i32 / 2 + 3 {
                         walls.insert(a);
                         walls.insert(b);
                     }
@@ -119,22 +318,23 @@ impl Simulation {
         }
 
         // Keep a broad central shipping lane open.
-        walls.retain(|p| p.y != HEIGHT / 2 && p.y != HEIGHT / 2 - 1);
+        walls.retain(|p| p.y != scenario.height / 2 && p.y != scenario.height / 2 - 1);
 
         let mut crystals = Vec::new();
         let mut occupied = walls.clone();
         occupied.extend(bases);
         // Tutorial pair: each fleet can see a nearby source immediately, so
         // the first match demonstrates the harvest → return → deposit loop.
-        let tutorial_left = Pos::new(4, HEIGHT / 2);
-        let tutorial_right = Pos::new(WIDTH - 1 - tutorial_left.x, HEIGHT - 1 - tutorial_left.y);
+        let tutorial_left = Pos::new(4.min(scenario.width / 2 - 2), scenario.height / 2);
+        let tutorial_right = Pos::new(scenario.width - 1 - tutorial_left.x, scenario.height - 1 - tutorial_left.y);
         crystals.push(Crystal { position: tutorial_left, amount: 10 });
         crystals.push(Crystal { position: tutorial_right, amount: 10 });
         occupied.insert(tutorial_left);
         occupied.insert(tutorial_right);
-        while crystals.len() < 8 {
-            let p = Pos::new(rng.range(4, WIDTH / 2), rng.range(2, HEIGHT - 2));
-            let mirror = Pos::new(WIDTH - 1 - p.x, HEIGHT - 1 - p.y);
+        let paired_sites = scenario.crystal_sites.saturating_sub(1).max(4) & !1;
+        while crystals.len() < paired_sites {
+            let p = Pos::new(rng.range(4, scenario.width / 2), rng.range(2, scenario.height - 2));
+            let mirror = Pos::new(scenario.width - 1 - p.x, scenario.height - 1 - p.y);
             if !occupied.contains(&p) && !occupied.contains(&mirror) {
                 let amount = 6 + rng.range(0, 5) as u8;
                 crystals.push(Crystal { position: p, amount });
@@ -145,22 +345,22 @@ impl Simulation {
         }
 
         // A rich neutral objective creates interaction in the middle.
-        let center = Pos::new(WIDTH / 2 - 1, HEIGHT / 2);
+        let center = Pos::new(scenario.width / 2 - 1, scenario.height / 2);
         crystals.push(Crystal { position: center, amount: 16 });
 
-        let starts = [-1, 0, 1];
         let mut drones = Vec::new();
         for team in Team::ALL {
-            for (slot, offset) in starts.into_iter().enumerate() {
+            for slot in 0..scenario.drones_per_team {
+                let offset = slot as i32 - scenario.drones_per_team as i32 / 2;
                 let base = bases[team.index()];
                 drones.push(Drone {
                     id: slot,
                     team,
                     position: Pos::new(base.x, base.y + offset),
                     cargo: 0,
-                    role: if team == Team::Amber && slot == 0 { Role::Scout } else { Role::Courier },
+                    role: Role::Courier,
                     target: None,
-                    reason: "Booting flight plan",
+                    reason: "Booting flight plan".into(),
                     move_request: None,
                     request_since: 0,
                     blocked_turns: 0,
@@ -171,30 +371,38 @@ impl Simulation {
         }
 
         let mut sim = Self {
-            turn: 0, scores: [0, 0], bases, walls, drones, crystals,
+            scenario, turn: 0, scores: [0, 0], bases, walls, drones, crystals,
             memories: [TeamMemory::default(), TeamMemory::default()],
             finished: false,
             last_event: "Telemetry online — both fleets launched".into(),
             turn_explanation: "Both fleets are choosing their first assignments.".into(),
+            bots: Vec::new(),
         };
         sim.observe();
+        sim.bots = sim.drones.iter().map(|drone| factory(drone.team, drone.id)).collect();
         sim
     }
 
     pub fn step(&mut self) {
         if self.finished { return; }
         self.observe();
-        let actions: Vec<Action> = (0..self.drones.len())
-            .map(|index| self.decide(index))
-            .collect();
+        let decisions: Vec<Decision> = (0..self.drones.len()).map(|index| {
+            let observation = self.observation_for(index);
+            self.bots[index].decide(&observation)
+        }).collect();
+        for (index, decision) in decisions.iter().enumerate() {
+            self.drones[index].role = decision.role;
+            self.drones[index].target = decision.target;
+            self.drones[index].reason = decision.reason.into();
+        }
         self.turn_explanation = self.drones.iter().map(|drone| {
             let target = drone.target.map_or("—".to_string(), |p| p.board_label());
             format!("{}{} {} → {}", if drone.team == Team::Azure { "A" } else { "B" }, drone.id + 1, drone.reason, target)
         }).collect::<Vec<_>>().join("\n");
 
-        let planned_moves: Vec<Option<Pos>> = actions.iter().map(|action| {
-            match action {
-                Action::Move(next) if self.passable(*next) => Some(*next),
+        let planned_moves: Vec<Option<Pos>> = decisions.iter().enumerate().map(|(index, decision)| {
+            match decision.intent {
+                Intent::Move(next) if self.drones[index].position.distance(next) == 1 && self.passable(next) => Some(next),
                 _ => None,
             }
         }).collect();
@@ -239,9 +447,9 @@ impl Simulation {
             Self::can_execute_move(index, &planned_moves, &selected, &occupants, &mut resolution)
         }).collect();
 
-        for (index, action) in actions.into_iter().enumerate() {
-            match action {
-                Action::Move(next) if executable[index] => {
+        for (index, decision) in decisions.into_iter().enumerate() {
+            match decision.intent {
+                Intent::Move(next) if executable[index] => {
                     let previous = self.drones[index].position;
                     self.drones[index].position = next;
                     self.drones[index].move_request = None;
@@ -249,13 +457,13 @@ impl Simulation {
                     self.drones[index].last_position = Some(previous);
                     self.drones[index].yield_cooldown = self.drones[index].yield_cooldown.saturating_sub(1);
                 }
-                Action::Move(_) => {
+                Intent::Move(_) => {
                     self.drones[index].blocked_turns += 1;
                     if self.drones[index].blocked_turns >= 2 {
                         self.drones[index].yield_cooldown = 3;
                     }
                 }
-                Action::Harvest => {
+                Intent::Harvest => {
                     if self.drones[index].cargo < CARGO_CAPACITY {
                         if let Some(crystal) = self.crystals.iter_mut().find(|c| c.position == self.drones[index].position && c.amount > 0) {
                             crystal.amount -= 1;
@@ -264,7 +472,7 @@ impl Simulation {
                         }
                     }
                 }
-                Action::Deposit => {
+                Intent::Deposit => {
                     let drone = &mut self.drones[index];
                     if drone.position == self.bases[drone.team.index()] && drone.cargo > 0 {
                         let delivered = drone.cargo as u32;
@@ -279,7 +487,7 @@ impl Simulation {
 
         self.turn += 1;
         self.observe();
-        self.finished = self.turn >= MAX_TURNS || self.crystals.iter().all(|c| c.amount == 0) && self.drones.iter().all(|d| d.cargo == 0);
+        self.finished = self.turn >= self.scenario.max_turns || self.crystals.iter().all(|c| c.amount == 0) && self.drones.iter().all(|d| d.cargo == 0);
         if self.finished {
             self.last_event = match self.scores[0].cmp(&self.scores[1]) {
                 std::cmp::Ordering::Greater => "Match complete — Azure wins".into(),
@@ -290,7 +498,7 @@ impl Simulation {
     }
 
     fn drone_order(&self, index: usize) -> usize {
-        self.drones[index].team.index() * 3 + self.drones[index].id
+        self.drones[index].team.index() * self.scenario.drones_per_team + self.drones[index].id
     }
 
     fn traffic_priority(&self, index: usize) -> (u8, u32, usize) {
@@ -339,9 +547,12 @@ impl Simulation {
         for team in Team::ALL {
             let memory = &mut self.memories[team.index()];
             for drone in self.drones.iter().filter(|d| d.team == team) {
-                for x in 0..WIDTH { for y in 0..HEIGHT {
+                for x in 0..self.scenario.width { for y in 0..self.scenario.height {
                     let p = Pos::new(x, y);
-                    if drone.position.distance(p) <= SENSOR_RANGE { memory.explored.insert(p); }
+                    if drone.position.distance(p) <= SENSOR_RANGE {
+                        memory.explored.insert(p);
+                        if self.walls.contains(&p) { memory.known_walls.insert(p); }
+                    }
                 }}
             }
             for crystal in &self.crystals {
@@ -352,6 +563,37 @@ impl Simulation {
         }
     }
 
+    /// Produces the complete information boundary for one bot. Keeping this
+    /// constructor in the engine makes accidental access to hidden state easy
+    /// to audit and keeps all third-party bots on equal footing.
+    pub fn observation_for(&self, index: usize) -> Observation {
+        let drone = &self.drones[index];
+        let team = drone.team;
+        let memory = &self.memories[team.index()];
+        let as_view = |drone: &Drone| DroneView {
+            id: drone.id,
+            team: drone.team,
+            position: drone.position,
+            cargo: drone.cargo,
+            target: drone.target,
+            blocked_turns: drone.blocked_turns,
+            last_position: drone.last_position,
+            yield_cooldown: drone.yield_cooldown,
+        };
+        Observation {
+            turn: self.turn,
+            width: self.scenario.width,
+            height: self.scenario.height,
+            me: as_view(drone),
+            base: self.bases[team.index()],
+            allies: self.drones.iter().filter(|other| other.team == team).map(as_view).collect(),
+            explored: memory.explored.clone(),
+            known_walls: memory.known_walls.clone(),
+            known_crystals: memory.known_crystals.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
     fn decide(&mut self, index: usize) -> Action {
         let drone = self.drones[index].clone();
         let team = drone.team;
@@ -379,14 +621,21 @@ impl Simulation {
         // hybrid scout: on a three-drone fleet, a permanently dedicated scout
         // spends too much of the team's carrying capacity. It scouts only until
         // the team has enough choices, then joins the logistics loop.
-        let scouting_coverage_limit = (WIDTH * HEIGHT) as usize * SCOUT_COVERAGE_LIMIT_PERCENT / 100;
+        let scouting_coverage_limit = (self.scenario.width * self.scenario.height) as usize * SCOUT_COVERAGE_LIMIT_PERCENT / 100;
         let needs_more_intel = known.len() < SCOUT_SOURCE_GOAL
             && self.memories[team.index()].explored.len() < scouting_coverage_limit;
-        if team == Team::Amber && drone.id == 0 && needs_more_intel {
+        let strategy = self.scenario.strategies[team.index()];
+        let should_scout = match strategy {
+            Strategy::Autonomous => false,
+            Strategy::DedicatedScout => drone.id == 0 && self.memories[team.index()].explored.len() < (self.scenario.width * self.scenario.height) as usize,
+            Strategy::HybridScout => drone.id == 0 && needs_more_intel,
+        };
+        if should_scout {
             let target = drone.target.filter(|target| !self.memories[team.index()].explored.contains(target))
                 .or_else(|| self.frontier_target(team, drone.position, drone.id));
             if let Some(target) = target {
-                self.set_intent(index, Role::Scout, Some(target), "Scouting until two sources are known");
+                let reason = if strategy == Strategy::DedicatedScout { "Dedicated scout charting the world" } else { "Scouting until two sources are known" };
+                self.set_intent(index, Role::Scout, Some(target), reason);
                 return self.move_toward_for_drone(index, target);
             }
         }
@@ -403,7 +652,7 @@ impl Simulation {
                 sorted.sort_by_key(|p| (drone.position.distance(*p), p.x, p.y));
                 sorted[drone.id % sorted.len()]
             };
-            self.set_intent(index, Role::Courier, Some(target), if team == Team::Amber { "Assigned to a team resource" } else { "Heading to nearest known resource" });
+            self.set_intent(index, Role::Courier, Some(target), if strategy == Strategy::Autonomous { "Heading to nearest known resource" } else { "Assigned to a team resource" });
             let action = self.move_toward_for_drone(index, target);
             if !matches!(action, Action::Wait) || drone.position == target { return action; }
             // Drop an unreachable remembered target immediately and resume exploration.
@@ -432,21 +681,24 @@ impl Simulation {
         }
     }
 
+    #[allow(dead_code)]
     fn set_intent(&mut self, index: usize, role: Role, target: Option<Pos>, reason: &'static str) {
         self.drones[index].role = role;
         self.drones[index].target = target;
-        self.drones[index].reason = reason;
+        self.drones[index].reason = reason.into();
     }
 
+    #[allow(dead_code)]
     fn frontier_target(&self, team: Team, from: Pos, slot: usize) -> Option<Pos> {
         let explored = &self.memories[team.index()].explored;
-        let mut candidates: Vec<Pos> = (0..WIDTH).flat_map(|x| (0..HEIGHT).map(move |y| Pos::new(x, y)))
+        let mut candidates: Vec<Pos> = (0..self.scenario.width).flat_map(|x| (0..self.scenario.height).map(move |y| Pos::new(x, y)))
             .filter(|p| !self.walls.contains(p) && !explored.contains(p))
             .collect();
         candidates.sort_by_key(|p| (from.distance(*p) + ((p.x + p.y + slot as i32 * 3).rem_euclid(7)), p.x, p.y));
         candidates.into_iter().find(|candidate| !matches!(self.move_toward(from, *candidate), Action::Wait))
     }
 
+    #[allow(dead_code)]
     fn move_toward(&self, from: Pos, target: Pos) -> Action {
         if from == target { return Action::Wait; }
         let mut queue = VecDeque::from([from]);
@@ -470,6 +722,7 @@ impl Simulation {
     /// After losing two reservations, a drone yields into a free side lane if
     /// one still has a route to its goal. This turns a face-to-face queue into
     /// a deliberate detour instead of an infinite left/right dance.
+    #[allow(dead_code)]
     fn move_toward_for_drone(&self, index: usize, target: Pos) -> Action {
         let drone = &self.drones[index];
         let direct = self.move_toward(drone.position, target);
@@ -485,6 +738,7 @@ impl Simulation {
         alternatives.first().map_or(direct, |(_, candidate)| Action::Move(*candidate))
     }
 
+    #[allow(dead_code)]
     fn route_distance(&self, from: Pos, target: Pos) -> Option<i32> {
         let mut queue = VecDeque::from([(from, 0)]);
         let mut visited = HashSet::from([from]);
@@ -499,17 +753,18 @@ impl Simulation {
         None
     }
 
+    #[allow(dead_code)]
     fn parking_spot(&self, team: Team, id: usize) -> Pos {
-        let azure_slots = [Pos::new(2, 3), Pos::new(2, 12), Pos::new(2, 5)];
-        let slot = azure_slots[id % azure_slots.len()];
+        let rows = (self.scenario.height - 2).max(1) as usize;
+        let slot = Pos::new(2 + (id / rows) as i32, 1 + (id % rows) as i32);
         match team {
             Team::Azure => slot,
-            Team::Amber => Pos::new(WIDTH - 1 - slot.x, HEIGHT - 1 - slot.y),
+            Team::Amber => Pos::new(self.scenario.width - 1 - slot.x, self.scenario.height - 1 - slot.y),
         }
     }
 
     fn passable(&self, p: Pos) -> bool {
-        p.x >= 0 && p.x < WIDTH && p.y >= 0 && p.y < HEIGHT && !self.walls.contains(&p)
+        p.x >= 0 && p.x < self.scenario.width && p.y >= 0 && p.y < self.scenario.height && !self.walls.contains(&p)
     }
 }
 
@@ -586,5 +841,34 @@ mod tests {
                 "seed {seed} timed out while final cargo was still waiting to be delivered"
             );
         }
+    }
+
+    #[test]
+    fn benchmark_scales_scenarios_and_returns_all_strategies() {
+        let rows = benchmark_leadership(3, 1);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].drones_per_team, 2);
+        assert_eq!(rows[1].drones_per_team, 3);
+        assert!(rows.iter().all(|row| row.dedicated_win_rate >= 0.0 && row.dedicated_win_rate <= 100.0 && row.hybrid_win_rate >= 0.0 && row.hybrid_win_rate <= 100.0));
+    }
+
+    struct IllegalMoveBot;
+    impl Bot for IllegalMoveBot {
+        fn decide(&mut self, _observation: &Observation) -> Decision {
+            // A bot may ask, but cannot teleport: the engine is the referee.
+            Decision::new(Intent::Move(Pos::new(99, 99)), Role::Scout, None, "Testing referee")
+        }
+    }
+
+    #[test]
+    fn external_bot_only_submits_intents_and_engine_rejects_teleporting() {
+        let mut sim = Simulation::with_bot_factory(3, Scenario::default(), |_, _| Box::new(IllegalMoveBot));
+        let before: Vec<Pos> = sim.drones.iter().map(|drone| drone.position).collect();
+        sim.step();
+        let after: Vec<Pos> = sim.drones.iter().map(|drone| drone.position).collect();
+        assert_eq!(before, after, "the referee must reject a non-adjacent bot move");
+        let view = sim.observation_for(0);
+        assert!(!view.known_walls.is_empty() || !sim.walls.is_empty());
+        assert!(view.known_crystals.len() <= sim.crystals.len());
     }
 }

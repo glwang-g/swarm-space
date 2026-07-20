@@ -1,12 +1,15 @@
 use bevy::prelude::*;
-use bevy::window::{MonitorSelection, WindowMode, WindowResolution};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
+use bevy::camera::{Projection, Viewport};
+use bevy::camera::visibility::RenderLayers;
+use bevy::ui::IsDefaultUiCamera;
+use bevy::window::{MonitorSelection, WindowMode, WindowResolution, WindowResized};
 use swarm_core::*;
+use std::sync::{mpsc, Mutex};
 
-const CELL: f32 = 34.0;
-const BOARD_WIDTH: f32 = WIDTH as f32 * CELL;
-const BOARD_HEIGHT: f32 = HEIGHT as f32 * CELL;
 const PANEL_WIDTH: f32 = 330.0;
-const WINDOW_WIDTH: f32 = BOARD_WIDTH + PANEL_WIDTH;
+const MIN_CELL: f32 = 24.0;
+const MINIMAP_SIZE: f32 = 172.0;
 
 const BG: Color = Color::srgb(0.025, 0.045, 0.09);
 const SKY_TILE: Color = Color::srgb(0.055, 0.095, 0.16);
@@ -31,6 +34,49 @@ struct MatchState {
 #[derive(Resource)]
 struct UiFont(Handle<Font>);
 
+#[derive(Resource, Clone, Copy)]
+struct BoardLayout { cell: f32, origin: Vec2, size: Vec2 }
+
+impl BoardLayout {
+    fn for_scenario(scenario: Scenario, window_size: Vec2) -> Self {
+        let playfield_width = (window_size.x - PANEL_WIDTH).max(240.0);
+        // Cover the playable viewport instead of letterboxing it. Any excess
+        // becomes navigable world space, which is why the camera can pan.
+        let cell = (playfield_width / scenario.width as f32)
+            .max(window_size.y / scenario.height as f32)
+            .max(MIN_CELL);
+        let width = scenario.width as f32 * cell;
+        let height = scenario.height as f32 * cell;
+        Self {
+            cell,
+            // World coordinates are independent of the window. When this is
+            // larger than the viewport, the camera simply shows a portion.
+            origin: Vec2::new(-width / 2.0, -height / 2.0),
+            size: Vec2::new(width, height),
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct MiniMapDrag { active: bool }
+
+#[derive(Resource)]
+struct ExperimentLab {
+    visible: bool,
+    selected_drones: usize,
+    max_drones: usize,
+    samples: u64,
+    rows: Vec<BenchmarkRow>,
+    receiver: Option<Mutex<mpsc::Receiver<BenchmarkUpdate>>>,
+    benchmark_status: String,
+    benchmark_progress: Option<(u64, u64)>,
+}
+
+enum BenchmarkUpdate {
+    Progress { completed: u64, total: u64 },
+    Finished(Vec<BenchmarkRow>),
+}
+
 #[derive(Component)] struct WorldVisual;
 #[derive(Component)] struct DroneVisual(Team, usize);
 #[derive(Component)] struct DroneLabel(Team, usize);
@@ -45,36 +91,103 @@ struct UiFont(Handle<Font>);
 #[derive(Component)] struct EndOverlay;
 #[derive(Component)] struct EndText;
 #[derive(Component)] struct IntroOverlay;
+#[derive(Component)] struct LabOverlay;
+#[derive(Component)] struct LabText;
+#[derive(Component)] struct SidebarScroll;
+#[derive(Component)] struct MapCamera;
+#[derive(Component)] struct MiniMapViewport { scale: f32 }
 
-fn grid_translation(pos: Pos, z: f32) -> Vec3 {
-    let x = -WINDOW_WIDTH / 2.0 + (pos.x as f32 + 0.5) * CELL;
-    let y = -BOARD_HEIGHT / 2.0 + (pos.y as f32 + 0.5) * CELL;
+fn grid_translation(layout: BoardLayout, pos: Pos, z: f32) -> Vec3 {
+    let x = layout.origin.x + (pos.x as f32 + 0.5) * layout.cell;
+    let y = layout.origin.y + (pos.y as f32 + 0.5) * layout.cell;
     Vec3::new(x, y, z)
 }
 
-fn setup(mut commands: Commands, assets: Res<AssetServer>) {
-    commands.spawn((Camera2d, Camera { clear_color: ClearColorConfig::Custom(BG), ..default() }));
+fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Window>) {
     commands.insert_resource(UiFont(assets.load("Songti.ttf")));
     let simulation = Simulation::new(42);
-    spawn_world(&mut commands, &simulation);
+    let layout = BoardLayout::for_scenario(simulation.scenario, window_size(&windows));
+    let window = windows.single().expect("one primary window");
+    commands.spawn((
+        MapCamera,
+        Camera2d,
+        Camera { clear_color: ClearColorConfig::Custom(BG), viewport: Some(map_viewport(window)), ..default() },
+    ));
+    // UI must be laid out against the full window, not the cropped world
+    // viewport. Its render layer deliberately excludes the world sprites.
+    commands.spawn((
+        IsDefaultUiCamera,
+        RenderLayers::layer(1),
+        Camera2d,
+        Camera { order: 1, clear_color: ClearColorConfig::None, ..default() },
+    ));
+    commands.insert_resource(layout);
+    commands.insert_resource(MiniMapDrag::default());
+    spawn_world(&mut commands, &simulation, layout);
     spawn_ui(&mut commands);
     commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
+    commands.insert_resource(ExperimentLab {
+        visible: false, selected_drones: 3, max_drones: 8, samples: 6, rows: Vec::new(), receiver: None,
+        benchmark_status: "Press B to compare strategies across the selected sample set.".into(),
+        benchmark_progress: None,
+    });
 }
 
-fn spawn_world(commands: &mut Commands, sim: &Simulation) {
-    for x in 0..WIDTH { for y in 0..HEIGHT {
+fn window_size(windows: &Query<&Window>) -> Vec2 {
+    windows.single().map(|window| Vec2::new(window.resolution.width(), window.resolution.height()))
+        .unwrap_or(Vec2::new(1280.0, 720.0))
+}
+
+fn size_of(window: &Window) -> Vec2 {
+    Vec2::new(window.resolution.width(), window.resolution.height())
+}
+
+fn map_viewport(window: &Window) -> Viewport {
+    let panel = (PANEL_WIDTH * window.scale_factor()) as u32;
+    Viewport {
+        physical_position: UVec2::ZERO,
+        physical_size: UVec2::new(window.resolution.physical_width().saturating_sub(panel), window.resolution.physical_height()),
+        depth: 0.0..1.0,
+    }
+}
+
+fn minimap_content_rect(window: &Window, layout: BoardLayout) -> (Vec2, Vec2, f32) {
+    let scale = MINIMAP_SIZE / layout.size.x.max(layout.size.y);
+    let map_size = layout.size * scale;
+    let padding = 9.0;
+    let outer = MINIMAP_SIZE + padding * 2.0;
+    let frame_top_left = Vec2::new(
+        window.resolution.width() - PANEL_WIDTH - 14.0 - outer,
+        window.resolution.height() - 14.0 - outer,
+    );
+    (frame_top_left + Vec2::splat(padding) + (Vec2::splat(MINIMAP_SIZE) - map_size) * 0.5, map_size, scale)
+}
+
+fn clamp_camera_to_map(transform: &mut Transform, projection: &Projection, layout: BoardLayout, window: &Window) {
+    let Projection::Orthographic(projection) = projection else { return };
+    let playfield_width = (window.resolution.width() - PANEL_WIDTH).max(0.0);
+    let half_view = Vec2::new(playfield_width, window.resolution.height()) * projection.scale * 0.5;
+    let half_map = layout.size * 0.5;
+    let max_x = (half_map.x - half_view.x).max(0.0);
+    let max_y = (half_map.y - half_view.y).max(0.0);
+    transform.translation.x = transform.translation.x.clamp(-max_x, max_x);
+    transform.translation.y = transform.translation.y.clamp(-max_y, max_y);
+}
+
+fn spawn_world(commands: &mut Commands, sim: &Simulation, layout: BoardLayout) {
+    for x in 0..sim.scenario.width { for y in 0..sim.scenario.height {
         let p = Pos::new(x, y);
         let color = if sim.walls.contains(&p) { WALL } else { SKY_TILE };
-        let size = if sim.walls.contains(&p) { CELL - 3.0 } else { CELL - 1.0 };
-        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::splat(size)), Transform::from_translation(grid_translation(p, 0.0))));
+        let size = if sim.walls.contains(&p) { layout.cell - 3.0 } else { layout.cell - 1.0 };
+        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::splat(size)), Transform::from_translation(grid_translation(layout, p, 0.0))));
     }}
     // Go-style coordinates on all four edges stay above the fog. The board is
     // 24 cells wide, so columns run A–X and rows run 0–15.
-    for x in 0..WIDTH {
+    for x in 0..sim.scenario.width {
         let label = char::from_u32(u32::from(b'A') + x as u32).unwrap_or('?').to_string();
-        for y in [0, HEIGHT - 1] {
-            let mut position = grid_translation(Pos::new(x, y), 11.0);
-            position.y += if y == 0 { -CELL * 0.33 } else { CELL * 0.33 };
+        for y in [0, sim.scenario.height - 1] {
+            let mut position = grid_translation(layout, Pos::new(x, y), 11.0);
+            position.y += if y == 0 { -layout.cell * 0.33 } else { layout.cell * 0.33 };
             commands.spawn((
                 WorldVisual,
                 Text2d::new(label.clone()),
@@ -84,10 +197,10 @@ fn spawn_world(commands: &mut Commands, sim: &Simulation) {
             ));
         }
     }
-    for y in 0..HEIGHT {
-        for x in [0, WIDTH - 1] {
-            let mut position = grid_translation(Pos::new(x, y), 11.0);
-            position.x += if x == 0 { -CELL * 0.31 } else { CELL * 0.31 };
+    for y in 0..sim.scenario.height {
+        for x in [0, sim.scenario.width - 1] {
+            let mut position = grid_translation(layout, Pos::new(x, y), 11.0);
+            position.x += if x == 0 { -layout.cell * 0.31 } else { layout.cell * 0.31 };
             commands.spawn((
                 WorldVisual,
                 Text2d::new(y.to_string()),
@@ -99,16 +212,16 @@ fn spawn_world(commands: &mut Commands, sim: &Simulation) {
     }
     for team in Team::ALL {
         let color = if team == Team::Azure { AZURE } else { AMBER };
-        commands.spawn((WorldVisual, Sprite::from_color(color.with_alpha(0.32), Vec2::splat(CELL * 1.65)), Transform::from_translation(grid_translation(sim.bases[team.index()], 1.0))));
-        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::new(CELL * 0.72, CELL * 0.18)), Transform::from_translation(grid_translation(sim.bases[team.index()], 2.0))));
+        commands.spawn((WorldVisual, Sprite::from_color(color.with_alpha(0.32), Vec2::splat(layout.cell * 1.65)), Transform::from_translation(grid_translation(layout, sim.bases[team.index()], 1.0))));
+        commands.spawn((WorldVisual, Sprite::from_color(color, Vec2::new(layout.cell * 0.72, layout.cell * 0.18)), Transform::from_translation(grid_translation(layout, sim.bases[team.index()], 2.0))));
     }
     for crystal in &sim.crystals {
-        commands.spawn((WorldVisual, CrystalVisual(crystal.position), Sprite::from_color(CRYSTAL, Vec2::splat(CELL * 0.42)), Transform { translation: grid_translation(crystal.position, 3.0), rotation: Quat::from_rotation_z(0.785), ..default() }));
+        commands.spawn((WorldVisual, CrystalVisual(crystal.position), Sprite::from_color(CRYSTAL, Vec2::splat(layout.cell * 0.42)), Transform { translation: grid_translation(layout, crystal.position, 3.0), rotation: Quat::from_rotation_z(0.785), ..default() }));
     }
     for drone in &sim.drones {
         let color = if drone.team == Team::Azure { AZURE } else { AMBER };
-        commands.spawn((WorldVisual, TargetVisual(drone.team, drone.id), Sprite::from_color(color.with_alpha(0.18), Vec2::splat(CELL * 0.72)), Transform::from_translation(grid_translation(drone.position, 2.5)), Visibility::Hidden));
-        commands.spawn((WorldVisual, DroneVisual(drone.team, drone.id), Sprite::from_color(color, Vec2::new(CELL * 0.66, CELL * 0.52)), Transform::from_translation(grid_translation(drone.position, 5.0))));
+        commands.spawn((WorldVisual, TargetVisual(drone.team, drone.id), Sprite::from_color(color.with_alpha(0.18), Vec2::splat(layout.cell * 0.72)), Transform::from_translation(grid_translation(layout, drone.position, 2.5)), Visibility::Hidden));
+        commands.spawn((WorldVisual, DroneVisual(drone.team, drone.id), Sprite::from_color(color, Vec2::new(layout.cell * 0.66, layout.cell * 0.52)), Transform::from_translation(grid_translation(layout, drone.position, 5.0))));
         let label = format!("{}{}", if drone.team == Team::Azure { "A" } else { "B" }, drone.id + 1);
         commands.spawn((
             WorldVisual,
@@ -116,27 +229,103 @@ fn spawn_world(commands: &mut Commands, sim: &Simulation) {
             Text2d::new(label),
             TextFont::from_font_size(11.0),
             TextColor(Color::srgb(0.97, 0.99, 1.0)),
-            Transform::from_translation(grid_translation(drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0)),
+            Transform::from_translation(grid_translation(layout, drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0)),
         ));
     }
-    for x in 0..WIDTH { for y in 0..HEIGHT {
+    for x in 0..sim.scenario.width { for y in 0..sim.scenario.height {
         let p = Pos::new(x, y);
-        commands.spawn((WorldVisual, FogVisual(p), Sprite::from_color(Color::srgba(0.005, 0.012, 0.035, 0.94), Vec2::splat(CELL)), Transform::from_translation(grid_translation(p, 10.0)), Visibility::Hidden));
+        commands.spawn((WorldVisual, FogVisual(p), Sprite::from_color(Color::srgba(0.005, 0.012, 0.035, 0.94), Vec2::splat(layout.cell)), Transform::from_translation(grid_translation(layout, p, 10.0)), Visibility::Hidden));
     }}
+    spawn_minimap(commands, sim, layout);
+}
+
+fn spawn_minimap(commands: &mut Commands, sim: &Simulation, layout: BoardLayout) {
+    let scale = MINIMAP_SIZE / layout.size.x.max(layout.size.y);
+    let map_size = layout.size * scale;
+    let padding = 9.0;
+    let outer = MINIMAP_SIZE + padding * 2.0;
+    commands.spawn((
+        WorldVisual,
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(PANEL_WIDTH + 14.0), bottom: Val::Px(14.0),
+            width: Val::Px(outer), height: Val::Px(outer),
+            border: UiRect::all(Val::Px(1.0)), ..default()
+        },
+        BackgroundColor(Color::srgba(0.02, 0.04, 0.08, 0.94)),
+        BorderColor::all(Color::srgba(0.35, 0.53, 0.70, 0.78)),
+    )).with_children(|frame| {
+        let offset = (MINIMAP_SIZE - map_size) * 0.5;
+        frame.spawn((
+            WorldVisual,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(padding + offset.x), top: Val::Px(padding + offset.y),
+                width: Val::Px(map_size.x), height: Val::Px(map_size.y), ..default()
+            },
+            BackgroundColor(Color::srgb(0.035, 0.07, 0.12)),
+        )).with_children(|map| {
+            for x in 0..sim.scenario.width { for y in 0..sim.scenario.height {
+                let pos = Pos::new(x, y);
+                let color = if sim.walls.contains(&pos) { WALL }
+                    else if sim.crystals.iter().any(|crystal| crystal.position == pos && crystal.amount > 0) { CRYSTAL }
+                    else { SKY_TILE };
+                map.spawn((
+                    WorldVisual,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(x as f32 * layout.cell * scale),
+                        // UI coordinates run downward; board coordinates run upward.
+                        top: Val::Px((sim.scenario.height - 1 - y) as f32 * layout.cell * scale),
+                        width: Val::Px((layout.cell * scale).ceil()), height: Val::Px((layout.cell * scale).ceil()),
+                        ..default()
+                    },
+                    BackgroundColor(color),
+                ));
+            }}
+            for team in Team::ALL {
+                let base = sim.bases[team.index()];
+                let color = if team == Team::Azure { AZURE } else { AMBER };
+                map.spawn((
+                    WorldVisual,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(base.x as f32 * layout.cell * scale),
+                        top: Val::Px((sim.scenario.height - 1 - base.y) as f32 * layout.cell * scale),
+                        width: Val::Px((layout.cell * scale).max(3.0)), height: Val::Px((layout.cell * scale).max(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(color),
+                ));
+            }
+            map.spawn((
+                WorldVisual,
+                MiniMapViewport { scale },
+                Node {
+                    position_type: PositionType::Absolute,
+                    border: UiRect::all(Val::Px(1.5)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.45, 0.72, 1.0, 0.08)),
+                BorderColor::all(Color::srgba(0.72, 0.88, 1.0, 0.94)),
+            ));
+        });
+    });
 }
 
 fn text_style(size: f32, color: Color) -> (TextFont, TextColor) { (TextFont::from_font_size(size), TextColor(color)) }
 
 fn spawn_ui(commands: &mut Commands) {
-    commands.spawn((Node {
+    commands.spawn((SidebarScroll, ScrollPosition::default(), Node {
         position_type: PositionType::Absolute, right: Val::Px(0.0), top: Val::Px(0.0),
         width: Val::Px(PANEL_WIDTH), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(22.0)),
-        flex_direction: FlexDirection::Column, row_gap: Val::Px(13.0), ..default()
+        flex_direction: FlexDirection::Column, row_gap: Val::Px(11.0), overflow: Overflow::scroll_y(),
+        scrollbar_width: 6.0, ..default()
     }, BackgroundColor(Color::srgb(0.035, 0.06, 0.105)))).with_children(|p| {
         p.spawn((Text::new("SWARM SPACE"), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
-        p.spawn((Text::new("Floating Isles\nLogistics Duel"), text_style(29.0, Color::WHITE).0, text_style(29.0, Color::WHITE).1));
+        p.spawn((Text::new("Floating Isles Logistics Duel"), text_style(23.0, Color::WHITE).0, text_style(23.0, Color::WHITE).1));
         p.spawn((Text::new("HOW TO READ THE MAP"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(6.0)), ..default() }));
-        p.spawn((Text::new("◆ crystal   ◼ wall   ● base\nBLUE = Greedy   ORANGE = Explorer\nGlobal fog: black unknown · blue/orange team intel · violet shared"), text_style(13.0, Color::srgb(0.72, 0.82, 0.92)).0, text_style(13.0, Color::srgb(0.72, 0.82, 0.92)).1));
+        p.spawn((Text::new("◆ crystal  ◼ wall  ● base\nFog: black unknown · blue/orange intel · violet shared"), text_style(12.0, Color::srgb(0.72, 0.82, 0.92)).0, text_style(12.0, Color::srgb(0.72, 0.82, 0.92)).1));
         p.spawn((ScoreText, Text::new(""), text_style(26.0, Color::WHITE).0, text_style(26.0, Color::WHITE).1));
         p.spawn((Node { width: Val::Percent(100.0), height: Val::Px(6.0), ..default() }, BackgroundColor(Color::srgb(0.10, 0.15, 0.22)))).with_children(|bar| {
             bar.spawn((ProgressFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(AZURE)));
@@ -146,12 +335,12 @@ fn spawn_ui(commands: &mut Commands) {
         p.spawn((FleetText, Text::new(""), text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).0, text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).1));
         p.spawn(Node { flex_grow: 1.0, ..default() });
         p.spawn((EventText, Text::new(""), text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).0, text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).1));
-        p.spawn((Text::new("SPACE pause  N step  T teaching mode\nV view  1/2/3 speed  R replay  G new map  F11 fullscreen"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1));
+        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nL lab · SPACE pause · N step · V view · 1/2/3 speed\nR replay · G new map · F11 fullscreen"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
     });
 
     commands.spawn((EndOverlay, Node {
         position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
-        width: Val::Px(BOARD_WIDTH), height: Val::Percent(100.0), justify_content: JustifyContent::Center,
+        right: Val::Px(PANEL_WIDTH), bottom: Val::Px(0.0), justify_content: JustifyContent::Center,
         align_items: AlignItems::Center, ..default()
     }, BackgroundColor(Color::srgba(0.015, 0.025, 0.055, 0.76)), Visibility::Hidden)).with_children(|p| {
         p.spawn((EndText, Text::new(""), text_style(38.0, Color::WHITE).0, text_style(38.0, Color::WHITE).1, TextLayout::justify(Justify::Center)));
@@ -159,7 +348,7 @@ fn spawn_ui(commands: &mut Commands) {
 
     commands.spawn((IntroOverlay, Node {
         position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
-        width: Val::Px(BOARD_WIDTH), height: Val::Percent(100.0), justify_content: JustifyContent::Center,
+        right: Val::Px(PANEL_WIDTH), bottom: Val::Px(0.0), justify_content: JustifyContent::Center,
         align_items: AlignItems::Center, ..default()
     }, BackgroundColor(Color::srgba(0.015, 0.025, 0.055, 0.92)))).with_children(|p| {
         p.spawn((Node { width: Val::Px(470.0), padding: UiRect::all(Val::Px(30.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(14.0), ..default() }, BackgroundColor(Color::srgb(0.055, 0.09, 0.15)))).with_children(|card| {
@@ -170,11 +359,25 @@ fn spawn_ui(commands: &mut Commands) {
             card.spawn((Text::new("按 Enter 或 Space 开始比赛"), text_style(19.0, Color::WHITE).0, text_style(19.0, Color::WHITE).1));
         });
     });
+
+    commands.spawn((LabOverlay, Node {
+        position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0),
+        right: Val::Px(PANEL_WIDTH), bottom: Val::Px(0.0), justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center, ..default()
+    }, BackgroundColor(Color::srgba(0.012, 0.024, 0.055, 0.94)), Visibility::Hidden)).with_children(|p| {
+        p.spawn((Node { width: Val::Px(650.0), padding: UiRect::all(Val::Px(28.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(12.0), ..default() }, BackgroundColor(Color::srgb(0.045, 0.085, 0.145)))).with_children(|card| {
+            card.spawn((Text::new("LEADERSHIP EXPERIMENT LAB"), text_style(25.0, Color::WHITE).0, text_style(25.0, Color::WHITE).1));
+            card.spawn((LabText, Text::new("Preparing benchmark…"), text_style(15.0, Color::srgb(0.82, 0.89, 0.96)).0, text_style(15.0, Color::srgb(0.82, 0.89, 0.96)).1));
+            card.spawn((Text::new("- / + fleet size   Enter restart with selected scenario\n[ / ] benchmark samples   B run comparison table\nL close lab (match stays paused) · Same seeded maps · density-preserving scale"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1));
+        });
+    });
 }
 
 fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<MatchState>,
+    mut lab: ResMut<ExperimentLab>,
+    mut layout: ResMut<BoardLayout>,
     mut commands: Commands,
     visuals: Query<Entity, With<WorldVisual>>,
     mut windows: Query<&mut Window>,
@@ -206,6 +409,39 @@ fn controls(
             Some(Team::Amber) => None,
         };
     }
+    if keys.just_pressed(KeyCode::KeyL) {
+        lab.visible = !lab.visible;
+        // The lab is a deliberate break in the match. Closing it is not an
+        // implicit resume: Space remains the explicit resume control, while
+        // Enter starts the newly selected scenario.
+        state.paused = true;
+    }
+    if lab.visible && keys.just_pressed(KeyCode::Minus) {
+        lab.selected_drones = lab.selected_drones.saturating_sub(1).max(2);
+    }
+    if lab.visible && keys.just_pressed(KeyCode::Equal) {
+        lab.selected_drones = (lab.selected_drones + 1).min(16);
+    }
+    if lab.visible && keys.just_pressed(KeyCode::BracketLeft) {
+        lab.samples = lab.samples.saturating_sub(1).max(2);
+    }
+    if lab.visible && keys.just_pressed(KeyCode::BracketRight) {
+        lab.samples = (lab.samples + 1).min(24);
+    }
+    if lab.visible && keys.just_pressed(KeyCode::KeyB) { launch_benchmark(&mut lab); }
+    if lab.visible && keys.just_pressed(KeyCode::Enter) {
+        let scenario = Scenario::scaled(lab.selected_drones, [Strategy::Autonomous, Strategy::HybridScout]);
+        for entity in &visuals { commands.entity(entity).despawn(); }
+        state.simulation = Simulation::with_scenario(state.seed, scenario);
+        let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
+        *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
+        state.paused = false;
+        state.guided = false;
+        state.view_team = None;
+        state.accumulator = 0.0;
+        lab.visible = false;
+        spawn_world(&mut commands, &state.simulation, *layout);
+    }
     if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; }
     if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
     if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
@@ -216,12 +452,229 @@ fn controls(
         if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
         for entity in &visuals { commands.entity(entity).despawn(); }
         state.simulation = Simulation::new(state.seed);
+        let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
+        *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
         state.paused = false;
         state.intro = false;
         state.guided = false;
         state.view_team = None;
         state.accumulator = 0.0;
-        spawn_world(&mut commands, &state.simulation);
+        spawn_world(&mut commands, &state.simulation, *layout);
+    }
+}
+
+fn launch_benchmark(lab: &mut ExperimentLab) {
+    if lab.receiver.is_some() {
+        lab.benchmark_status = "Benchmark is already running — please wait for this sample set.".into();
+        return;
+    }
+    let (sender, receiver) = mpsc::channel();
+    let max_drones = lab.max_drones;
+    let samples = lab.samples;
+    lab.receiver = Some(Mutex::new(receiver));
+    lab.rows.clear();
+    lab.benchmark_progress = Some((0, (max_drones as u64 - 1) * samples * 4));
+    lab.benchmark_status = format!("Running: 2–{max_drones} drones/team, {samples} seeded maps, both side assignments…");
+    std::thread::spawn(move || {
+        let rows = benchmark_leadership_with_progress(max_drones, samples, |completed, total| {
+            let _ = sender.send(BenchmarkUpdate::Progress { completed, total });
+        });
+        let _ = sender.send(BenchmarkUpdate::Finished(rows));
+    });
+}
+
+fn update_lab(mut lab: ResMut<ExperimentLab>, mut overlays: Query<&mut Visibility, With<LabOverlay>>, mut text: Query<&mut Text, With<LabText>>) {
+    let mut updates = Vec::new();
+    if let Some(receiver) = &lab.receiver {
+        if let Ok(receiver) = receiver.lock() {
+            while let Ok(update) = receiver.try_recv() {
+                updates.push(update);
+            }
+        }
+    }
+    if !updates.is_empty() {
+        let mut finished = None;
+        for update in updates {
+            match update {
+                BenchmarkUpdate::Progress { completed, total } => lab.benchmark_progress = Some((completed, total)),
+                BenchmarkUpdate::Finished(rows) => finished = Some(rows),
+            }
+        }
+        if let Some(rows) = finished {
+            lab.rows = rows;
+            lab.receiver = None;
+            lab.benchmark_progress = Some((1, 1));
+            lab.benchmark_status = "Finished. Positive B score difference means the organised B plan outscored autonomous A.".into();
+        }
+    }
+    if let Ok(mut visibility) = overlays.single_mut() {
+        *visibility = if lab.visible { Visibility::Visible } else { Visibility::Hidden };
+    }
+    if !lab.is_changed() { return; }
+    if let Ok(mut value) = text.single_mut() {
+        let mut lines = vec![
+            format!("Selected preview: {} drones/team · Enter to play it", lab.selected_drones),
+            format!("Benchmark range: 2–{} drones/team · {} seeded maps each · B to run", lab.max_drones, lab.samples),
+            "Map area, crystal sites, obstacles and turn budget scale with fleet size.".into(),
+            lab.benchmark_status.clone(),
+            "\n fleet | B dedicated vs A auto | B hybrid vs A auto | better B plan".into(),
+        ];
+        if let Some((completed, total)) = lab.benchmark_progress {
+            let percent = if total == 0 { 0 } else { completed * 100 / total };
+            let filled = (percent / 5) as usize;
+            lines.push(format!("[{}{}] {percent:>3}%  {completed}/{total} matches", "#".repeat(filled), ".".repeat(20 - filled)));
+        }
+        for row in &lab.rows {
+            let dedicated = format!("{:+.1} / {:>4.0}%", row.dedicated_delta, row.dedicated_win_rate);
+            let hybrid = format!("{:+.1} / {:>4.0}%", row.hybrid_delta, row.hybrid_win_rate);
+            let best = if row.dedicated_delta > 0.0 && row.dedicated_delta >= row.hybrid_delta { "SCOUT" }
+                else if row.hybrid_delta > 0.0 { "HYBRID" } else { "AUTO" };
+            lines.push(format!(" {:>5} | {:>21} | {:>18} | {best}", row.drones_per_team, dedicated, hybrid));
+        }
+        lines.push("\nEach cell is B score difference / B win rate. Every seed runs both left/right assignments.".into());
+        **value = lines.join("\n");
+    }
+}
+
+// The map lives in world coordinates, so a window resize requires rebuilding
+// the lightweight visual layer around the unchanged simulation state.
+fn resize_board(
+    mut resized: MessageReader<WindowResized>,
+    windows: Query<&Window>,
+    state: Res<MatchState>,
+    mut layout: ResMut<BoardLayout>,
+    mut commands: Commands,
+    visuals: Query<Entity, With<WorldVisual>>,
+    mut cameras: Query<&mut Camera, With<MapCamera>>,
+) {
+    if resized.read().next().is_none() { return; }
+    *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size(&windows));
+    if let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) {
+        camera.viewport = Some(map_viewport(window));
+    }
+    for entity in &visuals { commands.entity(entity).despawn(); }
+    spawn_world(&mut commands, &state.simulation, *layout);
+}
+
+fn map_camera_controls(
+    mut wheel: MessageReader<MouseWheel>,
+    mut motion: MessageReader<MouseMotion>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window>,
+    layout: Res<BoardLayout>,
+    mut cameras: Query<(&mut Transform, &mut Projection), With<MapCamera>>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let playfield_width = (window.resolution.width() - PANEL_WIDTH).max(0.0);
+    let (minimap_origin, minimap_size, _) = minimap_content_rect(window, *layout);
+    let pointer_in_minimap = window.cursor_position().is_some_and(|cursor| {
+        cursor.x >= minimap_origin.x && cursor.x <= minimap_origin.x + minimap_size.x
+            && cursor.y >= minimap_origin.y && cursor.y <= minimap_origin.y + minimap_size.y
+    });
+    let pointer_in_map = window.cursor_position().is_some_and(|cursor| cursor.x < playfield_width) && !pointer_in_minimap;
+    let Ok((mut transform, mut camera_projection)) = cameras.single_mut() else { return };
+    let Projection::Orthographic(projection) = &mut *camera_projection else { return };
+
+    if pointer_in_map {
+        for event in wheel.read() {
+            let amount = match event.unit { MouseScrollUnit::Line => event.y, MouseScrollUnit::Pixel => event.y / 38.0 };
+            if amount > 0.0 { projection.scale = (projection.scale * 0.86).max(0.35); }
+            if amount < 0.0 { projection.scale = (projection.scale * 1.16).min(1.0); }
+        }
+    } else {
+        // This reader must still consume events outside the map so a later
+        // pointer move cannot apply stale wheel input to the camera.
+        wheel.clear();
+    }
+    if (keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight)) && keys.just_pressed(KeyCode::ArrowUp) {
+        projection.scale = (projection.scale * 0.86).max(0.35);
+    }
+    if (keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight)) && keys.just_pressed(KeyCode::ArrowDown) {
+        projection.scale = (projection.scale * 1.16).min(1.0);
+    }
+
+    if pointer_in_map && (mouse.pressed(MouseButton::Middle) || (keys.pressed(KeyCode::Space) && mouse.pressed(MouseButton::Left))) {
+        for event in motion.read() {
+            transform.translation.x -= event.delta.x * projection.scale;
+            transform.translation.y += event.delta.y * projection.scale;
+        }
+    } else {
+        motion.clear();
+    }
+
+    // Keep the viewport over the map. A small board remains centered; a large
+    // board can be panned only until its edge reaches the viewport edge.
+    clamp_camera_to_map(&mut transform, &camera_projection, *layout, window);
+}
+
+fn minimap_controls(
+    mut motion: MessageReader<MouseMotion>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut drag: ResMut<MiniMapDrag>,
+    windows: Query<&Window>,
+    layout: Res<BoardLayout>,
+    mut cameras: Query<(&mut Transform, &Projection), With<MapCamera>>,
+) {
+    let (Ok(window), Ok((mut camera, projection))) = (windows.single(), cameras.single_mut()) else { return };
+    let Some(cursor) = window.cursor_position() else { return };
+    let (origin, size, scale) = minimap_content_rect(window, *layout);
+    let inside = cursor.x >= origin.x && cursor.x <= origin.x + size.x && cursor.y >= origin.y && cursor.y <= origin.y + size.y;
+    if mouse.just_pressed(MouseButton::Left) && inside {
+        drag.active = true;
+        let half_map = layout.size * 0.5;
+        camera.translation.x = (cursor.x - origin.x) / scale - half_map.x;
+        camera.translation.y = half_map.y - (cursor.y - origin.y) / scale;
+    }
+    if !mouse.pressed(MouseButton::Left) { drag.active = false; }
+    if drag.active {
+        for event in motion.read() {
+            camera.translation.x += event.delta.x / scale;
+            camera.translation.y -= event.delta.y / scale;
+        }
+    } else {
+        motion.clear();
+    }
+    clamp_camera_to_map(&mut camera, projection, *layout, window);
+}
+
+fn sync_minimap_viewport(
+    windows: Query<&Window>,
+    layout: Res<BoardLayout>,
+    cameras: Query<(&Transform, &Projection), With<MapCamera>>,
+    mut viewport: Query<(&MiniMapViewport, &mut Node)>,
+) {
+    let (Ok(window), Ok((camera, projection)), Ok((mini, mut node))) = (windows.single(), cameras.single(), viewport.single_mut()) else { return };
+    let Projection::Orthographic(projection) = projection else { return };
+    let playfield_width = (window.resolution.width() - PANEL_WIDTH).max(0.0);
+    let half_view = Vec2::new(playfield_width, window.resolution.height()) * projection.scale * 0.5;
+    let half_map = layout.size * 0.5;
+    let visible_min = (camera.translation.truncate() - half_view).max(-half_map);
+    let visible_max = (camera.translation.truncate() + half_view).min(half_map);
+    let world_size = (visible_max - visible_min).max(Vec2::ZERO);
+    node.left = Val::Px((visible_min.x + half_map.x) * mini.scale);
+    node.top = Val::Px((half_map.y - visible_max.y) * mini.scale);
+    node.width = Val::Px(world_size.x * mini.scale);
+    node.height = Val::Px(world_size.y * mini.scale);
+}
+
+fn scroll_sidebar(
+    mut wheel: MessageReader<MouseWheel>,
+    mut sidebars: Query<(&mut ScrollPosition, &ComputedNode), With<SidebarScroll>>,
+    windows: Query<&Window>,
+) {
+    let over_panel = windows.single().ok().and_then(|window| window.cursor_position())
+        .is_none_or(|cursor| cursor.x >= window_size(&windows).x - PANEL_WIDTH);
+    if !over_panel { wheel.clear(); return; }
+    for event in wheel.read() {
+        let delta = match event.unit {
+            MouseScrollUnit::Line => event.y * 34.0,
+            MouseScrollUnit::Pixel => event.y,
+        };
+        for (mut position, node) in &mut sidebars {
+            let max_scroll = (node.content_size().y - node.size().y).max(0.0) * node.inverse_scale_factor;
+            position.y = (position.y - delta).clamp(0.0, max_scroll);
+        }
     }
 }
 
@@ -238,6 +691,7 @@ fn run_match(time: Res<Time>, mut state: ResMut<MatchState>) {
 
 fn sync_visuals(
     state: Res<MatchState>,
+    layout: Res<BoardLayout>,
     mut visuals: ParamSet<(
         Query<(&DroneVisual, &mut Transform, &mut Sprite, &mut Visibility)>,
         Query<(&DroneLabel, &mut Transform, &mut Visibility)>,
@@ -253,7 +707,7 @@ fn sync_visuals(
 
     for (marker, mut transform, mut sprite, mut visibility) in &mut visuals.p0() {
         if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
-            transform.translation = grid_translation(drone.position, 5.0);
+            transform.translation = grid_translation(*layout, drone.position, 5.0);
             let fullness = drone.cargo as f32 / CARGO_CAPACITY as f32;
             sprite.color = if drone.team == Team::Azure { AZURE } else { AMBER }.mix(&Color::WHITE, fullness * 0.35);
             *visibility = match viewed_team {
@@ -264,7 +718,7 @@ fn sync_visuals(
     }
     for (marker, mut transform, mut visibility) in &mut visuals.p1() {
         if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
-            transform.translation = grid_translation(drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0);
+            transform.translation = grid_translation(*layout, drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0);
             *visibility = match viewed_team {
                 Some(team) if drone.team != team && !is_currently_visible(team, drone.position) => Visibility::Hidden,
                 _ => Visibility::Visible,
@@ -273,7 +727,7 @@ fn sync_visuals(
     }
     for (marker, mut transform, mut visibility) in &mut visuals.p2() {
         if let Some(target) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1).and_then(|d| d.target) {
-            transform.translation = grid_translation(target, 2.5);
+            transform.translation = grid_translation(*layout, target, 2.5);
             *visibility = if viewed_team.map_or(true, |team| team == marker.0) { Visibility::Visible } else { Visibility::Hidden };
         } else { *visibility = Visibility::Hidden; }
     }
@@ -378,6 +832,6 @@ fn main() {
                 }), ..default() }),
         )
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, run_match, sync_visuals, update_ui, apply_ui_font, disable_word_segmentation).chain())
+        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_lab, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
         .run();
 }
