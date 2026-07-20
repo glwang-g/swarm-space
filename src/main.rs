@@ -5,6 +5,8 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{MonitorSelection, WindowMode, WindowResolution, WindowResized};
 use swarm_core::*;
+use swarm_core::bots::BaselineBot;
+mod bots;
 
 const PANEL_WIDTH: f32 = 330.0;
 const MIN_CELL: f32 = 24.0;
@@ -28,6 +30,7 @@ struct MatchState {
     speed: usize,
     seed: u64,
     accumulator: f32,
+    replay_log: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -64,6 +67,7 @@ struct ArenaSetup {
     drones_per_team: usize,
     crystal_sites: usize,
     wall_chance_percent: u32,
+    my_bot: bool,
 }
 
 impl Default for ArenaSetup {
@@ -73,7 +77,21 @@ impl Default for ArenaSetup {
             drones_per_team: scenario.drones_per_team,
             crystal_sites: scenario.crystal_sites,
             wall_chance_percent: scenario.wall_chance_percent,
+            my_bot: false,
         }
+    }
+}
+
+fn make_simulation(seed: u64, setup: &ArenaSetup) -> Simulation {
+    let scenario = setup.scenario();
+    if setup.my_bot {
+        Simulation::with_bot_factory(seed, scenario, |team, _id| {
+            if team == Team::Azure { Box::new(bots::my_bot::MyBot) } else {
+                Box::new(BaselineBot::new(Strategy::HybridScout))
+            }
+        })
+    } else {
+        Simulation::with_scenario(seed, scenario)
     }
 }
 
@@ -101,6 +119,7 @@ impl ArenaSetup {
 #[derive(Component)] struct EndText;
 #[derive(Component)] struct IntroOverlay;
 #[derive(Component)] struct ArenaSetupText;
+#[derive(Component)] struct CustomBotText;
 #[derive(Component)] struct SidebarScroll;
 #[derive(Component)] struct MapCamera;
 #[derive(Component)] struct MiniMapViewport { scale: f32 }
@@ -133,7 +152,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Windo
     commands.insert_resource(MiniMapDrag::default());
     spawn_world(&mut commands, &simulation, layout);
     spawn_ui(&mut commands);
-    commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
+    commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0, replay_log: Vec::new() });
     commands.insert_resource(ArenaSetup::default());
 }
 
@@ -335,13 +354,27 @@ fn spawn_ui(commands: &mut Commands) {
             bar.spawn((ProgressFill, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(AZURE)));
         });
         p.spawn((StatusText, Text::new(""), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
-        p.spawn((Text::new("SCENARIO SETUP"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(8.0)), ..default() }));
-        p.spawn((ArenaSetupText, Text::new(""), text_style(13.0, Color::srgb(0.80, 0.88, 0.96)).0, text_style(13.0, Color::srgb(0.80, 0.88, 0.96)).1));
+        p.spawn((Node {
+            width: Val::Percent(100.0), padding: UiRect::all(Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)), flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(7.0), ..default()
+        }, BackgroundColor(Color::srgb(0.055, 0.105, 0.17)), BorderColor::all(Color::srgb(0.22, 0.55, 0.80)))).with_children(|card| {
+            card.spawn((Text::new("EDITABLE SCENARIO"), text_style(13.0, Color::srgb(0.55, 0.82, 1.0)).0, text_style(13.0, Color::srgb(0.55, 0.82, 1.0)).1));
+            card.spawn((ArenaSetupText, Text::new(""), text_style(13.0, Color::srgb(0.90, 0.95, 1.0)).0, text_style(13.0, Color::srgb(0.90, 0.95, 1.0)).1));
+        });
+        p.spawn((Node {
+            width: Val::Percent(100.0), padding: UiRect::all(Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)), flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(6.0), ..default()
+        }, BackgroundColor(Color::srgb(0.07, 0.055, 0.12)), BorderColor::all(Color::srgb(0.48, 0.30, 0.78)))).with_children(|card| {
+            card.spawn((Text::new("CUSTOM BOT"), text_style(13.0, Color::srgb(0.78, 0.62, 1.0)).0, text_style(13.0, Color::srgb(0.78, 0.62, 1.0)).1));
+            card.spawn((CustomBotText, Text::new(""), text_style(13.0, Color::srgb(0.92, 0.88, 1.0)).0, text_style(13.0, Color::srgb(0.92, 0.88, 1.0)).1));
+        });
         p.spawn((Text::new("FLEET TELEMETRY"), text_style(13.0, MUTED).0, text_style(13.0, MUTED).1, Node { margin: UiRect::top(Val::Px(8.0)), ..default() }));
         p.spawn((FleetText, Text::new(""), text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).0, text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).1));
         p.spawn(Node { flex_grow: 1.0, ..default() });
         p.spawn((EventText, Text::new(""), text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).0, text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).1));
-        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nSPACE pause · N step · V view · 1/2/3 speed\nR replay · G new map · F11 fullscreen"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
+        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nSPACE pause · N step · V view · 1/2/3 speed\nM MyBot · R replay · G new map · F11 fullscreen\n比赛结束后逐回合日志写入 replays/"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
     });
 
     commands.spawn((EndOverlay, Node {
@@ -360,7 +393,7 @@ fn spawn_ui(commands: &mut Commands) {
         p.spawn((Node { width: Val::Px(470.0), padding: UiRect::all(Val::Px(30.0)), flex_direction: FlexDirection::Column, row_gap: Val::Px(14.0), ..default() }, BackgroundColor(Color::srgb(0.055, 0.09, 0.15)))).with_children(|card| {
             card.spawn((Text::new("漂浮群岛物流战"), text_style(32.0, Color::WHITE).0, text_style(32.0, Color::WHITE).1));
             card.spawn((Text::new("两支无人机舰队争夺天空晶体。\n300 回合内，把更多能量运回基地的一方获胜。"), text_style(17.0, Color::srgb(0.82, 0.89, 0.96)).0, text_style(17.0, Color::srgb(0.82, 0.89, 0.96)).1));
-            card.spawn((Text::new("蓝队：Greedy Bot，优先最近的已知晶体\n橙队：Explorer Bot，一架侦察、两架分工运输\n每架无人机只能看到附近 5 格，发现的信息会共享。"), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
+            card.spawn((Text::new("蓝队：Greedy Bot，优先最近的已知晶体\n橙队：Explorer Bot，一架侦察、两架分工运输\n按 M 可切换蓝队 MyBot；修改 src/bots/my_bot.rs 即可定制。\n每架无人机只能看到附近 5 格，发现的信息会共享。"), text_style(15.0, MUTED).0, text_style(15.0, MUTED).1));
             card.spawn((Text::new("观察顺序：找到晶体 → 采集 → 满载返航 → 交付"), text_style(15.0, Color::srgb(0.65, 0.95, 0.8)).0, text_style(15.0, Color::srgb(0.65, 0.95, 0.8)).1));
             card.spawn((Text::new("按 Enter 或 Space 开始比赛"), text_style(19.0, Color::WHITE).0, text_style(19.0, Color::WHITE).1));
         });
@@ -413,13 +446,15 @@ fn controls(
     if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; }
     if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
     if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
+    if keys.just_pressed(KeyCode::KeyM) { setup.my_bot = !setup.my_bot; state.paused = true; }
     if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.simulation.step(); state.paused = true; }
     let restart = keys.just_pressed(KeyCode::KeyR) || keys.just_pressed(KeyCode::Enter);
     let regenerate = keys.just_pressed(KeyCode::KeyG);
     if restart || regenerate {
         if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
         for entity in &visuals { commands.entity(entity).despawn(); }
-        state.simulation = Simulation::with_scenario(state.seed, setup.scenario());
+        state.simulation = make_simulation(state.seed, &setup);
+        state.replay_log.clear();
         let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
         *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
         state.paused = false;
@@ -510,8 +545,18 @@ fn update_arena_setup(setup: Res<ArenaSetup>, mut text: Query<&mut Text, With<Ar
     if !setup.is_changed() { return; }
     if let Ok(mut text) = text.single_mut() {
         **text = format!(
-            "公平镜像场景（双方相同）\n[ / ] 每队无人机：{}\n, / . 晶体点：{}\n; / ' 障碍密度：{}%\nEnter 应用设置并重新开局",
-            setup.drones_per_team, setup.crystal_sites, setup.wall_chance_percent,
+            "公平镜像：双方数值相同\n\n[  {}  ]  每队无人机     [ / ]\n[  {}  ]  晶体点         , / .\n[ {}% ]  障碍密度       ; / '\n\nM · 蓝队使用 MyBot：{}\nENTER · APPLY & RESTART",
+            setup.drones_per_team, setup.crystal_sites, setup.wall_chance_percent, if setup.my_bot { "ON" } else { "OFF" },
+        );
+    }
+}
+
+fn update_custom_bot(setup: Res<ArenaSetup>, mut text: Query<&mut Text, With<CustomBotText>>) {
+    if !setup.is_changed() { return; }
+    if let Ok(mut text) = text.single_mut() {
+        **text = format!(
+            "当前：{}\n状态：已编译，可直接对战\n代码：src/bots/my_bot.rs\n\n修改 decide() 后：\n1. cargo run\n2. 按 M 选择 MyBot\n3. 按 R 应用并重开",
+            if setup.my_bot { "MyBot（蓝队）" } else { "Greedy Bot（默认）" },
         );
     }
 }
@@ -665,7 +710,14 @@ fn run_match(time: Res<Time>, mut state: ResMut<MatchState>) {
     while state.accumulator >= interval {
         state.accumulator -= interval;
         state.simulation.step();
+        let replay_entry = format!("turn {}\n{}\nEVENT: {}", state.simulation.turn, state.simulation.turn_explanation, state.simulation.last_event);
+        state.replay_log.push(replay_entry);
         if state.simulation.finished { break; }
+    }
+    if state.simulation.finished && !state.replay_log.is_empty() {
+        let _ = std::fs::create_dir_all("replays");
+        let path = format!("replays/seed-{}.log", state.seed);
+        let _ = std::fs::write(path, state.replay_log.join("\n\n"));
     }
 }
 
@@ -748,6 +800,7 @@ fn sync_visuals(
 
 fn update_ui(
     state: Res<MatchState>,
+    setup: Res<ArenaSetup>,
     mut texts: ParamSet<(
         Query<&mut Text, With<ScoreText>>,
         Query<&mut Text, With<StatusText>>,
@@ -766,7 +819,8 @@ fn update_ui(
     if let Ok(mut text) = texts.p1().single_mut() {
         let remaining: u32 = sim.crystals.iter().map(|crystal| crystal.amount as u32).sum();
         let view = match state.view_team { None => "OMNISCIENT", Some(Team::Azure) => "AZURE MEMORY", Some(Team::Amber) => "AMBER MEMORY" };
-        **text = format!("AZURE  Greedy Bot       AMBER  Explorer Bot\nTurn {:03} / {}   {}   Speed {}×\nView: {}   Crystals remaining: {}",
+        **text = format!("AZURE  {}       AMBER  Explorer Bot\nTurn {:03} / {}   {}   Speed {}×\nView: {}   Crystals remaining: {}",
+            if setup.my_bot { "MyBot" } else { "Greedy Bot" },
             sim.turn, MAX_TURNS, if state.intro { "READY" } else if sim.finished { "MATCH OVER" } else if state.guided { "TEACHING" } else if state.paused { "PAUSED" } else { "RUNNING" }, state.speed, view, remaining);
     }
     let mut lines = Vec::new();
@@ -812,6 +866,6 @@ fn main() {
                 }), ..default() }),
         )
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_arena_setup, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
+        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_arena_setup, update_custom_bot, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
         .run();
 }

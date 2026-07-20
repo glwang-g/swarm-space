@@ -14,6 +14,10 @@
 读取全局地图的特权。自定义 Rust bot 的最小接口与示例见
 [docs/bot-api.md](docs/bot-api.md)。
 
+## 写自己的 Bot
+
+从 [`bots/README.md`](bots/README.md) 和 [`src/bots/my_bot.rs`](src/bots/my_bot.rs) 开始。游戏中按 `M` 选择蓝队使用 `MyBot`，再按 `R` 或 `Enter` 重开比赛；比赛结束后，逐回合行为记录会写入 `replays/seed-<seed>.log`。
+
 ## Run
 
 ```bash
@@ -25,6 +29,7 @@ cargo run
 - `Space`：暂停/继续
 - `N`：暂停时单步推进一回合
 - `T`：教学模式（自动暂停，逐回合显示每架无人机的决策）
+- `M`：切换蓝队为 `MyBot`（修改 `src/bots/my_bot.rs` 后重开）
 - `1` / `2` / `3`：1× / 4× / 16× 速度
 - `R`：用当前地图重新开始
 - `G`：生成新的对称地图并开始
