@@ -4657,11 +4657,19 @@ name = "swarm-core"
 version = "0.1.0"
 
 [[package]]
+name = "swarm-runner"
+version = "0.1.0"
+dependencies = [
+ "swarm-core",
+]
+
+[[package]]
 name = "swarm-space"
 version = "0.1.0"
 dependencies = [
  "bevy",
  "swarm-core",
+ "swarm-runner",
 ]
 
 [[package]]

@@ -281,9 +281,48 @@ pub struct Simulation {
     bots: Vec<Box<dyn Bot>>,
 }
 
+/// Renderer- and transport-friendly copy of the authoritative world state.
+/// Consumers should use this instead of depending on `Simulation` internals.
+#[derive(Clone, Debug)]
+pub struct WorldSnapshot {
+    pub scenario: Scenario,
+    pub turn: u32,
+    pub scores: [u32; 2],
+    pub bases: [Pos; 2],
+    pub walls: HashSet<Pos>,
+    pub drones: Vec<Drone>,
+    pub crystals: Vec<Crystal>,
+    pub memories: [TeamMemory; 2],
+    pub finished: bool,
+    pub last_event: String,
+    pub turn_explanation: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum MatchEvent {
+    TurnAdvanced { turn: u32, explanation: String, event: String },
+    MatchFinished { turn: u32, scores: [u32; 2] },
+}
+
 impl Simulation {
     pub fn new(seed: u64) -> Self {
         Self::with_scenario(seed, Scenario::default())
+    }
+
+    pub fn snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot {
+            scenario: self.scenario,
+            turn: self.turn,
+            scores: self.scores,
+            bases: self.bases,
+            walls: self.walls.clone(),
+            drones: self.drones.clone(),
+            crystals: self.crystals.clone(),
+            memories: self.memories.clone(),
+            finished: self.finished,
+            last_event: self.last_event.clone(),
+            turn_explanation: self.turn_explanation.clone(),
+        }
     }
 
     pub fn with_scenario(seed: u64, scenario: Scenario) -> Self {

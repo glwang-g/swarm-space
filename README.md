@@ -6,6 +6,9 @@
 
 这是一个 Battlecode 风格的短局“群智对决”原型，同时预留了未来扩展为 Screeps 风格持久世界的模拟边界。
 
+当前架构说明见 [docs/architecture.md](docs/architecture.md)。世界规则位于
+`swarm-core`，无头比赛和回放位于 `swarm-runner`，Bevy 只负责观战界面。
+
 ## Bot arena boundary
 
 规则引擎与策略已分离：每架无人机都由一个 `Bot` 实例根据受限的
@@ -46,7 +49,7 @@ cargo run
 - 同一目的地发生冲突时，移动会被取消
 - 回合上限 300，资源耗尽且没有携带货物时也会提前结束
 
-模拟规则由 `crates/swarm-core` 暴露，不依赖 Bevy 的渲染 API；当前实现通过过渡性 include 复用 `src/simulation.rs`，方便后续继续拆成纯核心库。Bevy 只负责观战界面。这使得未来可以把模拟核心编译为 WASM，并接入 xshow 的“群智空间”页面。
+模拟规则由 `crates/swarm-core` 暴露，不依赖 Bevy 的渲染 API；核心实现位于 `crates/swarm-core/src/`。Bevy 只负责观战界面。这使得未来可以把模拟核心编译为 WASM，并接入 xshow 的“群智空间”页面。
 
 核心还包含移动协商、不可达目标放弃、目标稳定性和死锁保护。workspace 测试会在 32 个不同 seed 上验证确定性、终局和无长期停摆。
 

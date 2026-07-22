@@ -6,6 +6,7 @@ use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{MonitorSelection, WindowMode, WindowResolution, WindowResized};
 use swarm_core::*;
 use swarm_core::bots::BaselineBot;
+use swarm_runner::MatchRunner;
 mod bots;
 
 const PANEL_WIDTH: f32 = 330.0;
@@ -22,7 +23,8 @@ const MUTED: Color = Color::srgb(0.52, 0.62, 0.72);
 
 #[derive(Resource)]
 struct MatchState {
-    simulation: Simulation,
+    runner: MatchRunner,
+    snapshot: WorldSnapshot,
     paused: bool,
     intro: bool,
     guided: bool,
@@ -30,7 +32,6 @@ struct MatchState {
     speed: usize,
     seed: u64,
     accumulator: f32,
-    replay_log: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -82,16 +83,16 @@ impl Default for ArenaSetup {
     }
 }
 
-fn make_simulation(seed: u64, setup: &ArenaSetup) -> Simulation {
+fn make_simulation(seed: u64, setup: &ArenaSetup) -> MatchRunner {
     let scenario = setup.scenario();
     if setup.my_bot {
-        Simulation::with_bot_factory(seed, scenario, |team, _id| {
+        MatchRunner::with_bot_factory(seed, scenario, |team, _id| {
             if team == Team::Azure { Box::new(bots::my_bot::MyBot) } else {
                 Box::new(BaselineBot::new(Strategy::HybridScout))
             }
         })
     } else {
-        Simulation::with_scenario(seed, scenario)
+        MatchRunner::new(seed, scenario)
     }
 }
 
@@ -132,8 +133,9 @@ fn grid_translation(layout: BoardLayout, pos: Pos, z: f32) -> Vec3 {
 
 fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Window>) {
     commands.insert_resource(UiFont(assets.load("Songti.ttf")));
-    let simulation = Simulation::new(42);
-    let layout = BoardLayout::for_scenario(simulation.scenario, window_size(&windows));
+    let runner = make_simulation(42, &ArenaSetup::default());
+    let snapshot = runner.snapshot();
+    let layout = BoardLayout::for_scenario(snapshot.scenario, window_size(&windows));
     let window = windows.single().expect("one primary window");
     commands.spawn((
         MapCamera,
@@ -150,9 +152,9 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Windo
     ));
     commands.insert_resource(layout);
     commands.insert_resource(MiniMapDrag::default());
-    spawn_world(&mut commands, &simulation, layout);
+    spawn_world(&mut commands, &snapshot, layout);
     spawn_ui(&mut commands);
-    commands.insert_resource(MatchState { simulation, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0, replay_log: Vec::new() });
+    commands.insert_resource(MatchState { runner, snapshot, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
     commands.insert_resource(ArenaSetup::default());
 }
 
@@ -197,7 +199,7 @@ fn clamp_camera_to_map(transform: &mut Transform, projection: &Projection, layou
     transform.translation.y = transform.translation.y.clamp(-max_y, max_y);
 }
 
-fn spawn_world(commands: &mut Commands, sim: &Simulation, layout: BoardLayout) {
+fn spawn_world(commands: &mut Commands, sim: &WorldSnapshot, layout: BoardLayout) {
     for x in 0..sim.scenario.width { for y in 0..sim.scenario.height {
         let p = Pos::new(x, y);
         let color = if sim.walls.contains(&p) { WALL } else { SKY_TILE };
@@ -262,7 +264,7 @@ fn spawn_world(commands: &mut Commands, sim: &Simulation, layout: BoardLayout) {
     spawn_minimap(commands, sim, layout);
 }
 
-fn spawn_minimap(commands: &mut Commands, sim: &Simulation, layout: BoardLayout) {
+fn spawn_minimap(commands: &mut Commands, sim: &WorldSnapshot, layout: BoardLayout) {
     let scale = MINIMAP_SIZE / layout.size.x.max(layout.size.y);
     let map_size = layout.size * scale;
     let padding = 9.0;
@@ -447,22 +449,22 @@ fn controls(
     if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
     if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
     if keys.just_pressed(KeyCode::KeyM) { setup.my_bot = !setup.my_bot; state.paused = true; }
-    if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.simulation.step(); state.paused = true; }
+    if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.runner.step(); state.snapshot = state.runner.snapshot(); state.paused = true; }
     let restart = keys.just_pressed(KeyCode::KeyR) || keys.just_pressed(KeyCode::Enter);
     let regenerate = keys.just_pressed(KeyCode::KeyG);
     if restart || regenerate {
         if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
         for entity in &visuals { commands.entity(entity).despawn(); }
-        state.simulation = make_simulation(state.seed, &setup);
-        state.replay_log.clear();
+        state.runner = make_simulation(state.seed, &setup);
+        state.snapshot = state.runner.snapshot();
         let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
-        *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size);
+        *layout = BoardLayout::for_scenario(state.runner.simulation.scenario, window_size);
         state.paused = false;
         state.intro = false;
         state.guided = false;
         state.view_team = None;
         state.accumulator = 0.0;
-        spawn_world(&mut commands, &state.simulation, *layout);
+        spawn_world(&mut commands, &state.snapshot, *layout);
     }
 }
 
@@ -573,12 +575,14 @@ fn resize_board(
     mut cameras: Query<&mut Camera, With<MapCamera>>,
 ) {
     if resized.read().next().is_none() { return; }
-    *layout = BoardLayout::for_scenario(state.simulation.scenario, window_size(&windows));
+    *layout = BoardLayout::for_scenario(state.snapshot.scenario, window_size(&windows));
     if let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) {
         camera.viewport = Some(map_viewport(window));
     }
     for entity in &visuals { commands.entity(entity).despawn(); }
-    spawn_world(&mut commands, &state.simulation, *layout);
+    // Rebuild only the presentation from the stable snapshot; the renderer
+    // does not need access to the runner's authoritative internals here.
+    spawn_world(&mut commands, &state.snapshot, *layout);
 }
 
 fn map_camera_controls(
@@ -704,20 +708,19 @@ fn scroll_sidebar(
 }
 
 fn run_match(time: Res<Time>, mut state: ResMut<MatchState>) {
-    if state.intro || state.paused || state.guided || state.simulation.finished { return; }
+    if state.intro || state.paused || state.guided || state.runner.simulation.finished { return; }
     state.accumulator += time.delta_secs();
     let interval = 0.24 / state.speed as f32;
     while state.accumulator >= interval {
         state.accumulator -= interval;
-        state.simulation.step();
-        let replay_entry = format!("turn {}\n{}\nEVENT: {}", state.simulation.turn, state.simulation.turn_explanation, state.simulation.last_event);
-        state.replay_log.push(replay_entry);
-        if state.simulation.finished { break; }
+        state.runner.step();
+        state.snapshot = state.runner.snapshot();
+        if state.runner.simulation.finished { break; }
     }
-    if state.simulation.finished && !state.replay_log.is_empty() {
+    if state.snapshot.finished && !state.runner.replay.is_empty() {
         let _ = std::fs::create_dir_all("replays");
         let path = format!("replays/seed-{}.log", state.seed);
-        let _ = std::fs::write(path, state.replay_log.join("\n\n"));
+        let _ = state.runner.write_replay(path);
     }
 }
 
@@ -733,12 +736,12 @@ fn sync_visuals(
     )>,
 ) {
     let viewed_team = state.view_team;
-    let is_currently_visible = |team: Team, pos: Pos| state.simulation.drones.iter()
+    let is_currently_visible = |team: Team, pos: Pos| state.snapshot.drones.iter()
         .filter(|drone| drone.team == team)
         .any(|drone| drone.position.distance(pos) <= SENSOR_RANGE);
 
     for (marker, mut transform, mut sprite, mut visibility) in &mut visuals.p0() {
-        if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
+        if let Some(drone) = state.snapshot.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
             transform.translation = grid_translation(*layout, drone.position, 5.0);
             let fullness = drone.cargo as f32 / CARGO_CAPACITY as f32;
             sprite.color = if drone.team == Team::Azure { AZURE } else { AMBER }.mix(&Color::WHITE, fullness * 0.35);
@@ -749,7 +752,7 @@ fn sync_visuals(
         }
     }
     for (marker, mut transform, mut visibility) in &mut visuals.p1() {
-        if let Some(drone) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
+        if let Some(drone) = state.snapshot.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1) {
             transform.translation = grid_translation(*layout, drone.position, 6.0) + Vec3::new(0.0, -1.0, 0.0);
             *visibility = match viewed_team {
                 Some(team) if drone.team != team && !is_currently_visible(team, drone.position) => Visibility::Hidden,
@@ -758,24 +761,24 @@ fn sync_visuals(
         }
     }
     for (marker, mut transform, mut visibility) in &mut visuals.p2() {
-        if let Some(target) = state.simulation.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1).and_then(|d| d.target) {
+        if let Some(target) = state.snapshot.drones.iter().find(|d| d.team == marker.0 && d.id == marker.1).and_then(|d| d.target) {
             transform.translation = grid_translation(*layout, target, 2.5);
             *visibility = if viewed_team.map_or(true, |team| team == marker.0) { Visibility::Visible } else { Visibility::Hidden };
         } else { *visibility = Visibility::Hidden; }
     }
     for (marker, mut visibility) in &mut visuals.p3() {
         let amount = match viewed_team {
-            Some(team) => state.simulation.memories[team.index()].known_crystals.get(&marker.0).copied().unwrap_or(0),
-            None => state.simulation.crystals.iter().find(|c| c.position == marker.0).map_or(0, |c| c.amount),
+            Some(team) => state.snapshot.memories[team.index()].known_crystals.get(&marker.0).copied().unwrap_or(0),
+            None => state.snapshot.crystals.iter().find(|c| c.position == marker.0).map_or(0, |c| c.amount),
         };
         *visibility = if amount > 0 { Visibility::Visible } else { Visibility::Hidden };
     }
     for (marker, mut sprite, mut visibility) in &mut visuals.p4() {
-        let azure_knows = state.simulation.memories[Team::Azure.index()].explored.contains(&marker.0);
-        let amber_knows = state.simulation.memories[Team::Amber.index()].explored.contains(&marker.0);
+        let azure_knows = state.snapshot.memories[Team::Azure.index()].explored.contains(&marker.0);
+        let amber_knows = state.snapshot.memories[Team::Amber.index()].explored.contains(&marker.0);
         match viewed_team {
             Some(team) => {
-                *visibility = if state.simulation.memories[team.index()].explored.contains(&marker.0) {
+                *visibility = if state.snapshot.memories[team.index()].explored.contains(&marker.0) {
                     Visibility::Hidden
                 } else {
                     sprite.color = Color::srgba(0.005, 0.012, 0.035, 0.94);
@@ -814,7 +817,7 @@ fn update_ui(
         Query<&mut Visibility, With<IntroOverlay>>,
     )>,
 ) {
-    let sim = &state.simulation;
+    let sim = &state.snapshot;
     if let Ok(mut text) = texts.p0().single_mut() { **text = format!("{}  :  {}", sim.scores[0], sim.scores[1]); }
     if let Ok(mut text) = texts.p1().single_mut() {
         let remaining: u32 = sim.crystals.iter().map(|crystal| crystal.amount as u32).sum();
