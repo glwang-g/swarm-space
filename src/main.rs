@@ -6,7 +6,8 @@ use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{MonitorSelection, WindowMode, WindowResolution, WindowResized};
 use swarm_core::*;
 use swarm_core::bots::BaselineBot;
-use swarm_runner::MatchRunner;
+use swarm_runner::{spawn_runner, MatchCommand, RunnerHandle, RunnerUpdate};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 mod bots;
 
 const PANEL_WIDTH: f32 = 330.0;
@@ -23,8 +24,9 @@ const MUTED: Color = Color::srgb(0.52, 0.62, 0.72);
 
 #[derive(Resource)]
 struct MatchState {
-    runner: MatchRunner,
+    runner: RunnerHandle,
     snapshot: WorldSnapshot,
+    bot_mode: Arc<AtomicBool>,
     paused: bool,
     intro: bool,
     guided: bool,
@@ -32,6 +34,7 @@ struct MatchState {
     speed: usize,
     seed: u64,
     accumulator: f32,
+    replay_log: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -83,17 +86,15 @@ impl Default for ArenaSetup {
     }
 }
 
-fn make_simulation(seed: u64, setup: &ArenaSetup) -> MatchRunner {
-    let scenario = setup.scenario();
-    if setup.my_bot {
-        MatchRunner::with_bot_factory(seed, scenario, |team, _id| {
-            if team == Team::Azure { Box::new(bots::my_bot::MyBot) } else {
-                Box::new(BaselineBot::new(Strategy::HybridScout))
-            }
-        })
-    } else {
-        MatchRunner::new(seed, scenario)
-    }
+fn make_runner(seed: u64, setup: &ArenaSetup, bot_mode: &Arc<AtomicBool>) -> RunnerHandle {
+    let bot_mode = Arc::clone(bot_mode);
+    spawn_runner(seed, setup.scenario(), move |team, _id| {
+        if bot_mode.load(Ordering::Relaxed) && team == Team::Azure {
+            Box::new(bots::my_bot::MyBot)
+        } else {
+            Box::new(BaselineBot::new(if team == Team::Azure { Strategy::Autonomous } else { Strategy::HybridScout }))
+        }
+    })
 }
 
 impl ArenaSetup {
@@ -133,8 +134,10 @@ fn grid_translation(layout: BoardLayout, pos: Pos, z: f32) -> Vec3 {
 
 fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Window>) {
     commands.insert_resource(UiFont(assets.load("Songti.ttf")));
-    let runner = make_simulation(42, &ArenaSetup::default());
-    let snapshot = runner.snapshot();
+    let setup = ArenaSetup::default();
+    let bot_mode = Arc::new(AtomicBool::new(setup.my_bot));
+    let runner = make_runner(42, &setup, &bot_mode);
+    let snapshot = runner.recv().and_then(|update| match update { RunnerUpdate::Snapshot(snapshot) => Some(snapshot), _ => None }).expect("runner initial snapshot");
     let layout = BoardLayout::for_scenario(snapshot.scenario, window_size(&windows));
     let window = windows.single().expect("one primary window");
     commands.spawn((
@@ -154,17 +157,13 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Windo
     commands.insert_resource(MiniMapDrag::default());
     spawn_world(&mut commands, &snapshot, layout);
     spawn_ui(&mut commands);
-    commands.insert_resource(MatchState { runner, snapshot, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0 });
-    commands.insert_resource(ArenaSetup::default());
+    commands.insert_resource(MatchState { runner, snapshot, bot_mode, paused: true, intro: true, guided: false, view_team: None, speed: 1, seed: 42, accumulator: 0.0, replay_log: Vec::new() });
+    commands.insert_resource(setup);
 }
 
 fn window_size(windows: &Query<&Window>) -> Vec2 {
     windows.single().map(|window| Vec2::new(window.resolution.width(), window.resolution.height()))
         .unwrap_or(Vec2::new(1280.0, 720.0))
-}
-
-fn size_of(window: &Window) -> Vec2 {
-    Vec2::new(window.resolution.width(), window.resolution.height())
 }
 
 fn map_viewport(window: &Window) -> Viewport {
@@ -407,9 +406,6 @@ fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<MatchState>,
     mut setup: ResMut<ArenaSetup>,
-    mut layout: ResMut<BoardLayout>,
-    mut commands: Commands,
-    visuals: Query<Entity, With<WorldVisual>>,
     mut windows: Query<&mut Window>,
 ) {
     if keys.just_pressed(KeyCode::F11) {
@@ -424,10 +420,14 @@ fn controls(
         if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
             state.intro = false;
             state.paused = false;
+            let _ = state.runner.send(MatchCommand::SetRunning(true));
         }
         return;
     }
-    if keys.just_pressed(KeyCode::Space) { state.paused = !state.paused; }
+    if keys.just_pressed(KeyCode::Space) {
+        state.paused = !state.paused;
+        let _ = state.runner.send(MatchCommand::SetRunning(!state.paused));
+    }
     if keys.just_pressed(KeyCode::KeyT) {
         state.guided = !state.guided;
         state.paused = state.guided;
@@ -445,26 +445,24 @@ fn controls(
     if keys.just_pressed(KeyCode::Period) { setup.crystal_sites = (setup.crystal_sites + 2).min(81); }
     if keys.just_pressed(KeyCode::Semicolon) { setup.wall_chance_percent = setup.wall_chance_percent.saturating_sub(2); }
     if keys.just_pressed(KeyCode::Quote) { setup.wall_chance_percent = (setup.wall_chance_percent + 2).min(35); }
-    if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; }
-    if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; }
-    if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; }
-    if keys.just_pressed(KeyCode::KeyM) { setup.my_bot = !setup.my_bot; state.paused = true; }
-    if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { state.runner.step(); state.snapshot = state.runner.snapshot(); state.paused = true; }
+    if keys.just_pressed(KeyCode::Digit1) { state.speed = 1; let _ = state.runner.send(MatchCommand::SetSpeed(1)); }
+    if keys.just_pressed(KeyCode::Digit2) { state.speed = 4; let _ = state.runner.send(MatchCommand::SetSpeed(4)); }
+    if keys.just_pressed(KeyCode::Digit3) { state.speed = 16; let _ = state.runner.send(MatchCommand::SetSpeed(16)); }
+    if keys.just_pressed(KeyCode::KeyM) { setup.my_bot = !setup.my_bot; state.bot_mode.store(setup.my_bot, Ordering::Relaxed); state.paused = true; let _ = state.runner.send(MatchCommand::SetRunning(false)); }
+    if keys.just_pressed(KeyCode::KeyN) && (state.paused || state.guided) { let _ = state.runner.send(MatchCommand::Step); state.paused = true; }
     let restart = keys.just_pressed(KeyCode::KeyR) || keys.just_pressed(KeyCode::Enter);
     let regenerate = keys.just_pressed(KeyCode::KeyG);
     if restart || regenerate {
         if regenerate { state.seed = state.seed.wrapping_mul(6364136223846793005).wrapping_add(1); }
-        for entity in &visuals { commands.entity(entity).despawn(); }
-        state.runner = make_simulation(state.seed, &setup);
-        state.snapshot = state.runner.snapshot();
-        let window_size = windows.single().map(|window| size_of(window)).unwrap_or(Vec2::new(1280.0, 720.0));
-        *layout = BoardLayout::for_scenario(state.runner.simulation.scenario, window_size);
+        state.bot_mode.store(setup.my_bot, Ordering::Relaxed);
+        state.replay_log.clear();
+        let _ = state.runner.send(MatchCommand::Restart { seed: state.seed, scenario: setup.scenario() });
+        let _ = state.runner.send(MatchCommand::SetRunning(true));
         state.paused = false;
         state.intro = false;
         state.guided = false;
         state.view_team = None;
         state.accumulator = 0.0;
-        spawn_world(&mut commands, &state.snapshot, *layout);
     }
 }
 
@@ -707,20 +705,35 @@ fn scroll_sidebar(
     }
 }
 
-fn run_match(time: Res<Time>, mut state: ResMut<MatchState>) {
-    if state.intro || state.paused || state.guided || state.runner.simulation.finished { return; }
-    state.accumulator += time.delta_secs();
-    let interval = 0.24 / state.speed as f32;
-    while state.accumulator >= interval {
-        state.accumulator -= interval;
-        state.runner.step();
-        state.snapshot = state.runner.snapshot();
-        if state.runner.simulation.finished { break; }
-    }
-    if state.snapshot.finished && !state.runner.replay.is_empty() {
-        let _ = std::fs::create_dir_all("replays");
-        let path = format!("replays/seed-{}.log", state.seed);
-        let _ = state.runner.write_replay(path);
+fn poll_runner(
+    mut state: ResMut<MatchState>,
+    mut commands: Commands,
+    visuals: Query<Entity, With<WorldVisual>>,
+    mut layout: ResMut<BoardLayout>,
+    windows: Query<&Window>,
+) {
+    while let Ok(update) = state.runner.try_recv() {
+        match update {
+            RunnerUpdate::Snapshot(snapshot) => {
+                let rebuild = snapshot.turn == 0 && state.snapshot.turn != 0;
+                state.snapshot = snapshot;
+                if rebuild {
+                    for entity in &visuals { commands.entity(entity).despawn(); }
+                    *layout = BoardLayout::for_scenario(state.snapshot.scenario, window_size(&windows));
+                    spawn_world(&mut commands, &state.snapshot, *layout);
+                }
+            }
+            RunnerUpdate::Event(event) => match event {
+                swarm_core::MatchEvent::TurnAdvanced { turn, explanation, event } => {
+                    state.replay_log.push(format!("turn {turn}\n{explanation}\nEVENT: {event}"));
+                }
+                swarm_core::MatchEvent::MatchFinished { .. } => {
+                    let _ = std::fs::create_dir_all("replays");
+                    let path = format!("replays/seed-{}.log", state.seed);
+                    let _ = std::fs::write(path, state.replay_log.join("\n\n"));
+                }
+            }
+        }
     }
 }
 
@@ -869,6 +882,6 @@ fn main() {
                 }), ..default() }),
         )
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, run_match, sync_visuals, update_ui, update_arena_setup, update_custom_bot, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
+        .add_systems(Update, (controls, resize_board, map_camera_controls, minimap_controls, sync_minimap_viewport, poll_runner, sync_visuals, update_ui, update_arena_setup, update_custom_bot, scroll_sidebar, apply_ui_font, disable_word_segmentation).chain())
         .run();
 }
