@@ -24,6 +24,12 @@ allied shared discoveries (`explored`, `known_walls`, `known_crystals`) and
 allied positions. It does not include the authoritative map, untouched hidden
 crystals, opponent state, scores, or the simulation object.
 
+The runner may also provide persistent per-drone `AgentMemory` and a logical
+`TickBudget`. A Bot can override `decide_with_context` and return a
+`BotOutput`, containing its `Decision` plus a bounded `MemoryPatch`. Memory is
+Bot state, not authoritative world state; only the runner persists it between
+ticks.
+
 To run a custom bot for every drone, construct a simulation with a factory:
 
 ```rust
@@ -31,6 +37,11 @@ let sim = Simulation::with_bot_factory(seed, scenario, |team, id| {
     Box::new(MyBot::new(team, id))
 });
 ```
+
+For runners that own bot scheduling, create a world with
+`Simulation::without_bots`, call `observation_for` for each drone, collect one
+`Decision` per drone, and submit the complete set to `resolve_tick`. This keeps
+the bot runtime separate from the world referee.
 
 The built-in `Autonomous`, `DedicatedScout`, and `HybridScout` strategies are
 implemented as ordinary `BaselineBot`s through this same interface. They are

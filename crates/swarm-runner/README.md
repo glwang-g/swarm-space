@@ -10,4 +10,5 @@ let result = run_baseline(42, Scenario::default());
 println!("{:?} {:?}", result.scores, result.winner);
 ```
 
-Bevy viewer 只把 `MatchRunner::simulation` 映射成画面；未来 CLI、服务器和 WASM 适配器可以复用同一层。
+Bevy viewer 只接收 `RunnerUpdate::Snapshot(RenderSnapshot)`；它不持有或访问
+`MatchRunner` 和权威 `Simulation`。未来 CLI、服务器和 WASM 适配器可以复用同一层。
