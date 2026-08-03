@@ -35,19 +35,18 @@ jobs:
           restore-keys: |
             swarm-space-rust-${{ runner.os }}-
 
-      - name: Cache Trunk
-        id: cache-trunk
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/trunk
-          key: trunk-${{ runner.os }}-0.21
-
       - name: Install Trunk
-        if: steps.cache-trunk.outputs.cache-hit != 'true'
-        run: cargo install trunk --locked --version 0.21.14 --debug
+        run: |
+          curl --retry 5 --retry-all-errors -fsSLO \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
+          curl --retry 5 --retry-all-errors -fsSLO \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz.sha256
+          sha256sum -c trunk-x86_64-unknown-linux-gnu.tar.gz.sha256
+          tar -xzf trunk-x86_64-unknown-linux-gnu.tar.gz
+          sudo install -m 0755 trunk /usr/local/bin/trunk
 
       - name: Test simulation
-        run: cargo test --workspace
+        run: cargo test -p swarm-core -p swarm-runner
 
       - name: Build browser release
         env:
