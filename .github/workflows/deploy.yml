@@ -41,7 +41,9 @@ jobs:
             https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
           curl --retry 5 --retry-all-errors -fsSLO \
             https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz.sha256
-          sha256sum -c trunk-x86_64-unknown-linux-gnu.tar.gz.sha256
+          printf '%s  %s\n' \
+            "$(cat trunk-x86_64-unknown-linux-gnu.tar.gz.sha256)" \
+            trunk-x86_64-unknown-linux-gnu.tar.gz | sha256sum -c -
           tar -xzf trunk-x86_64-unknown-linux-gnu.tar.gz
           sudo install -m 0755 trunk /usr/local/bin/trunk
 
