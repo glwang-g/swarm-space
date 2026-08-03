@@ -3,10 +3,16 @@
 //! This crate deliberately knows nothing about Bevy. It is the seam for CLI
 //! tournaments, server matches, replay generation, and future WASM adapters.
 
+#[cfg(target_arch = "wasm32")]
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, TryRecvError};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{Receiver, Sender};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use swarm_core::bots::{AgentMemory, Bot, TickBudget};
 use swarm_core::{
@@ -231,32 +237,120 @@ pub enum RunnerUpdate {
     Event(MatchEvent),
 }
 
-/// The Bevy viewer owns this communication handle, never the MatchRunner.
+/// The viewer owns this communication handle, never the authoritative runner.
+/// Native builds use a worker thread; WASM builds drive the same command and
+/// update boundary from browser animation frames.
 pub struct RunnerHandle {
+    #[cfg(not(target_arch = "wasm32"))]
     commands: Sender<MatchCommand>,
+    #[cfg(not(target_arch = "wasm32"))]
     updates: Mutex<Receiver<RunnerUpdate>>,
+    #[cfg(target_arch = "wasm32")]
+    state: Mutex<WebRunnerState>,
 }
 
 impl RunnerHandle {
     pub fn send(&self, command: MatchCommand) -> Result<(), mpsc::SendError<MatchCommand>> {
-        self.commands.send(command)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return self.commands.send(command);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut state = self.state.lock().expect("runner state lock");
+            match command {
+                MatchCommand::Step => state.advance(),
+                MatchCommand::SetRunning(value) => state.running = value,
+                MatchCommand::SetSpeed(value) => state.speed = value.clamp(1, 16),
+                MatchCommand::Restart { seed, scenario } => {
+                    let WebRunnerState {
+                        factory,
+                        runner,
+                        updates,
+                        running,
+                        elapsed,
+                        ..
+                    } = &mut *state;
+                    *runner = MatchRunner::with_bot_factory(seed, scenario, factory);
+                    updates.push_back(RunnerUpdate::Snapshot(runner.snapshot()));
+                    *running = false;
+                    *elapsed = 0.0;
+                }
+                MatchCommand::Shutdown => state.shutdown = true,
+            }
+            Ok(())
+        }
     }
 
     pub fn try_recv(&self) -> Result<RunnerUpdate, TryRecvError> {
-        self.updates.lock().expect("runner update lock").try_recv()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return self.updates.lock().expect("runner update lock").try_recv();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.state
+                .lock()
+                .expect("runner state lock")
+                .updates
+                .pop_front()
+                .ok_or(TryRecvError::Empty)
+        }
     }
 
     pub fn recv(&self) -> Option<RunnerUpdate> {
-        self.updates.lock().expect("runner update lock").recv().ok()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return self.updates.lock().expect("runner update lock").recv().ok();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.state
+                .lock()
+                .expect("runner state lock")
+                .updates
+                .pop_front()
+        }
+    }
+
+    /// Advance the browser-owned runner without blocking the render thread.
+    pub fn update(&self, delta_seconds: f32) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = delta_seconds;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut state = self.state.lock().expect("runner state lock");
+            if state.shutdown || !state.running || state.runner.simulation.is_finished() {
+                return;
+            }
+            state.elapsed += delta_seconds.max(0.0);
+            let step_seconds = 0.24 / state.speed as f32;
+            let mut steps = 0;
+            while state.elapsed >= step_seconds && steps < 32 {
+                state.elapsed -= step_seconds;
+                state.advance();
+                steps += 1;
+                if state.runner.simulation.is_finished() {
+                    state.running = false;
+                    break;
+                }
+            }
+        }
     }
 }
 
 impl Drop for RunnerHandle {
     fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = self.commands.send(MatchCommand::Shutdown);
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(state) = self.state.get_mut() {
+            state.shutdown = true;
+        }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_runner<F>(seed: u64, scenario: Scenario, factory: F) -> RunnerHandle
 where
     F: FnMut(Team, usize) -> Box<dyn Bot> + Send + 'static,
@@ -313,6 +407,68 @@ where
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+type BotFactory = Box<dyn FnMut(Team, usize) -> Box<dyn Bot> + Send>;
+
+#[cfg(target_arch = "wasm32")]
+struct WebRunnerState {
+    runner: MatchRunner,
+    factory: BotFactory,
+    updates: VecDeque<RunnerUpdate>,
+    running: bool,
+    speed: u32,
+    elapsed: f32,
+    shutdown: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebRunnerState {
+    fn advance(&mut self) {
+        if let Some(event) = self.runner.step() {
+            if let Some(turn) = self.runner.replay.last() {
+                self.updates
+                    .push_back(RunnerUpdate::Event(MatchEvent::TurnAdvanced {
+                        turn: turn.turn,
+                        explanation: turn.explanation.clone(),
+                        event: turn.event.clone(),
+                        world_events: turn.world_events.clone(),
+                    }));
+            }
+            if let MatchEvent::MatchFinished { turn, scores } = event {
+                self.updates
+                    .push_back(RunnerUpdate::Event(MatchEvent::MatchFinished {
+                        turn,
+                        scores,
+                    }));
+            }
+            self.updates
+                .push_back(RunnerUpdate::Snapshot(self.runner.snapshot()));
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_runner<F>(seed: u64, scenario: Scenario, factory: F) -> RunnerHandle
+where
+    F: FnMut(Team, usize) -> Box<dyn Bot> + Send + 'static,
+{
+    let mut factory: BotFactory = Box::new(factory);
+    let runner = MatchRunner::with_bot_factory(seed, scenario, &mut factory);
+    let updates = VecDeque::from([RunnerUpdate::Snapshot(runner.snapshot())]);
+    RunnerHandle {
+        state: Mutex::new(WebRunnerState {
+            runner,
+            factory,
+            updates,
+            running: false,
+            speed: 1,
+            elapsed: 0.0,
+            shutdown: false,
+        }),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn advance(runner: &mut MatchRunner, updates: &Sender<RunnerUpdate>) {
     if let Some(event) = runner.step() {
         if let Some(turn) = runner.replay.last() {

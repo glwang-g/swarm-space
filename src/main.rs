@@ -171,7 +171,7 @@ fn grid_translation(layout: BoardLayout, pos: Pos, z: f32) -> Vec3 {
 }
 
 fn setup(mut commands: Commands, assets: Res<AssetServer>, windows: Query<&Window>) {
-    commands.insert_resource(UiFont(assets.load("Songti.ttf")));
+    commands.insert_resource(UiFont(assets.load("HiraginoSansGB.ttf")));
     let setup = ArenaSetup::default();
     let bot_mode = Arc::new(AtomicBool::new(setup.my_bot));
     let runner = make_runner(42, &setup, &bot_mode);
@@ -555,7 +555,7 @@ fn spawn_ui(commands: &mut Commands) {
         p.spawn((FleetText, Text::new(""), text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).0, text_style(14.0, Color::srgb(0.82, 0.88, 0.94)).1));
         p.spawn(Node { flex_grow: 1.0, ..default() });
         p.spawn((EventText, Text::new(""), text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).0, text_style(14.0, Color::srgb(0.72, 0.78, 0.87)).1));
-        p.spawn((Text::new("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nSPACE pause · N step · V view · 1/2/3 speed\nM MyBot · R replay · G new map · F11 fullscreen\n比赛结束后逐回合日志写入 replays/"), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
+        p.spawn((Text::new(format!("Map: wheel / Option+↑↓ zoom · middle-drag / Space-drag pan\nMini-map: click or drag the view frame · Panel: scroll wheel\nSPACE pause · N step · V view · 1/2/3 speed\nM MyBot · R replay · G new map · F11 fullscreen\n{}", replay_hint())), text_style(12.0, MUTED).0, text_style(12.0, MUTED).1));
     });
 
     commands
@@ -597,6 +597,16 @@ fn spawn_ui(commands: &mut Commands) {
             card.spawn((Text::new("按 Enter 或 Space 开始比赛"), text_style(19.0, Color::WHITE).0, text_style(19.0, Color::WHITE).1));
         });
     });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn replay_hint() -> &'static str {
+    "比赛结束后逐回合日志写入 replays/"
+}
+
+#[cfg(target_arch = "wasm32")]
+fn replay_hint() -> &'static str {
+    "浏览器版回放保留在当前对局中"
 }
 
 fn controls(
@@ -1065,6 +1075,10 @@ fn poll_runner(
     }
 }
 
+fn drive_runner(time: Res<Time>, state: Res<MatchState>) {
+    state.runner.update(time.delta_secs());
+}
+
 fn sync_visuals(
     state: Res<MatchState>,
     layout: Res<BoardLayout>,
@@ -1326,6 +1340,8 @@ fn main() {
                 title: "Swarm Space — Floating Isles Logistics Duel".into(),
                 resolution: WindowResolution::new(1280, 720),
                 resizable: true,
+                canvas: Some("#swarm-space".into()),
+                fit_canvas_to_parent: true,
                 ..default()
             }),
             ..default()
@@ -1339,6 +1355,7 @@ fn main() {
                 map_camera_controls,
                 minimap_controls,
                 sync_minimap_viewport,
+                drive_runner,
                 poll_runner,
                 sync_visuals,
                 update_ui,

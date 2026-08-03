@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#061127" />
+    <meta
+      name="description"
+      content="群智空间：观察两支自治无人机群体探索、协作并争夺浮空岛能源。"
+    />
+    <title>群智空间 · Swarm Space</title>
+    <link data-trunk rel="copy-file" href="assets/HiraginoSansGB.ttf" data-target-path="assets" />
+    <link data-trunk rel="rust" data-bin="swarm-space" data-wasm-opt="0" />
+    <style>
+      :root {
+        color-scheme: dark;
+        background: #061127;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #061127;
+      }
+
+      #swarm-space {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      .loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: #96b6d6;
+        font: 500 14px/1.5 system-ui, sans-serif;
+        letter-spacing: 0.12em;
+        pointer-events: none;
+      }
+
+      body:has(#swarm-space[width]) .loading {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="loading">LOADING SWARM SPACE…</div>
+    <canvas id="swarm-space" tabindex="0" aria-label="群智空间对战观测界面"></canvas>
+  </body>
+</html>

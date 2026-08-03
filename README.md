@@ -27,6 +27,19 @@
 cargo run
 ```
 
+## Web
+
+浏览器版本使用 WASM 运行同一个 Bevy 观战界面：
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked --version 0.21.14
+trunk serve
+```
+
+推送 `master` 后可自动发布到 `swarm.freexlib.com`，首次服务器与 DNS 配置见
+[docs/deployment.md](docs/deployment.md)。
+
 ## Controls
 
 - `Space`：暂停/继续

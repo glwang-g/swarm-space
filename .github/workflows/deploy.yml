@@ -1,0 +1,80 @@
+name: Deploy swarm.freexlib.com
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swarm-space-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Rust WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: swarm-space-rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-v1
+          restore-keys: |
+            swarm-space-rust-${{ runner.os }}-
+
+      - name: Cache Trunk
+        id: cache-trunk
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/trunk
+          key: trunk-${{ runner.os }}-0.21
+
+      - name: Install Trunk
+        if: steps.cache-trunk.outputs.cache-hit != 'true'
+        run: cargo install trunk --locked --version 0.21.14 --debug
+
+      - name: Test simulation
+        run: cargo test --workspace
+
+      - name: Build browser release
+        env:
+          NO_COLOR: "true"
+        run: trunk build --release
+
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.SWARM_SPACE_DEPLOY_KEY }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/swarm-space
+          chmod 0600 ~/.ssh/swarm-space
+          timeout 15 ssh-keyscan -H living.freexlib.com >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        run: |
+          ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 ubuntu@living.freexlib.com \
+            'mkdir -p /home/ubuntu/swarm-space/deploy-staging/dist /home/ubuntu/swarm-space/deploy-staging/nginx'
+          rsync -az --delete -e 'ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15' \
+            dist/ ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-staging/dist/
+          rsync -az -e 'ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15' \
+            deploy/nginx/ ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-staging/nginx/
+          scp -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 \
+            scripts/deploy-remote.sh ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-remote.sh
+
+      - name: Activate release
+        run: |
+          ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 ubuntu@living.freexlib.com \
+            'bash /home/ubuntu/swarm-space/deploy-remote.sh'
