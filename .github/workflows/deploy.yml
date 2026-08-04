@@ -49,5 +49,10 @@ jobs:
           sudo nginx -t
           sudo systemctl reload nginx
 
+      - name: Activate Freexlib portal
+        run: |
+          sudo install -d -m 0755 /var/www/freexlib-portal
+          sudo install -m 0644 portal/index.html /var/www/freexlib-portal/index.html
+
       - name: Verify production
         run: curl -fsS https://swarm.freexlib.com/ | grep -q '群智空间'
