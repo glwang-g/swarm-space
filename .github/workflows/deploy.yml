@@ -29,6 +29,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "/usr/local/bin" >> "$GITHUB_PATH"
           /home/ubuntu/.cargo/bin/rustup target add wasm32-unknown-unknown
+          /home/ubuntu/.cargo/bin/wasm-bindgen --version
           /usr/local/bin/trunk --version
 
       - name: Test simulation
