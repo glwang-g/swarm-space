@@ -10,42 +10,26 @@ permissions:
 
 concurrency:
   group: swarm-space-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: [self-hosted, linux, x64, swarm-space]
+    timeout-minutes: 30
+    env:
+      CARGO_HOME: /home/ubuntu/.cargo
+      CARGO_TARGET_DIR: /home/ubuntu/.cache/swarm-space/target
 
     steps:
       - name: Check out source
         uses: actions/checkout@v5
 
-      - name: Install Rust WASM target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Cache Rust build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: swarm-space-rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-v1
-          restore-keys: |
-            swarm-space-rust-${{ runner.os }}-
-
-      - name: Install Trunk
+      - name: Configure local toolchain
         run: |
-          curl --retry 5 --retry-all-errors -fsSLO \
-            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
-          curl --retry 5 --retry-all-errors -fsSLO \
-            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz.sha256
-          printf '%s  %s\n' \
-            "$(cat trunk-x86_64-unknown-linux-gnu.tar.gz.sha256)" \
-            trunk-x86_64-unknown-linux-gnu.tar.gz | sha256sum -c -
-          tar -xzf trunk-x86_64-unknown-linux-gnu.tar.gz
-          sudo install -m 0755 trunk /usr/local/bin/trunk
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          /home/ubuntu/.cargo/bin/rustup target add wasm32-unknown-unknown
+          /usr/local/bin/trunk --version
 
       - name: Test simulation
         run: cargo test -p swarm-core -p swarm-runner
@@ -55,27 +39,14 @@ jobs:
           NO_COLOR: "true"
         run: trunk build --release
 
-      - name: Configure SSH
-        env:
-          DEPLOY_KEY: ${{ secrets.SWARM_SPACE_DEPLOY_KEY }}
+      - name: Activate local release
         run: |
-          install -d -m 0700 ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/swarm-space
-          chmod 0600 ~/.ssh/swarm-space
-          timeout 15 ssh-keyscan -H living.freexlib.com >> ~/.ssh/known_hosts
+          sudo install -d -m 0755 /var/www/swarm-space
+          sudo rsync -a --delete dist/ /var/www/swarm-space/
+          sudo chown -R www-data:www-data /var/www/swarm-space
+          sudo install -m 0644 deploy/nginx/swarm-space-static.conf /etc/nginx/snippets/swarm-space-static.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
 
-      - name: Upload release
-        run: |
-          ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 ubuntu@living.freexlib.com \
-            'mkdir -p /home/ubuntu/swarm-space/deploy-staging/dist /home/ubuntu/swarm-space/deploy-staging/nginx'
-          rsync -az --delete -e 'ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15' \
-            dist/ ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-staging/dist/
-          rsync -az -e 'ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15' \
-            deploy/nginx/ ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-staging/nginx/
-          scp -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 \
-            scripts/deploy-remote.sh ubuntu@living.freexlib.com:/home/ubuntu/swarm-space/deploy-remote.sh
-
-      - name: Activate release
-        run: |
-          ssh -i ~/.ssh/swarm-space -o BatchMode=yes -o ServerAliveInterval=15 ubuntu@living.freexlib.com \
-            'bash /home/ubuntu/swarm-space/deploy-remote.sh'
+      - name: Verify production
+        run: curl -fsS https://swarm.freexlib.com/ | grep -q '群智空间'

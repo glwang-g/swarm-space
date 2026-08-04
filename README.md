@@ -2,34 +2,27 @@
 
 **群智空间**的第一个实验：**Floating Isles Logistics Duel（漂浮群岛物流战）**。
 
-两支 3 架无人机的自治群体，在一张公平对称的浮空岛地图上探索能量晶体、采集资源并运回基地。每架无人机都只能看到附近区域，Bot 会根据自己的共享记忆规划下一步动作。300 回合后，交付能量更多的一方获胜。
+两支 3 架无人机的自治群体，在公平对称的浮空岛地图上探索能量晶体、采集资源并运回基地。每架无人机只能看到附近区域，Bot 根据自己的观察与共享记忆提交下一步意图；世界引擎统一裁决移动、冲突、采集和交付。
 
-这是一个 Battlecode 风格的短局“群智对决”原型，同时预留了未来扩展为 Screeps 风格持久世界的模拟边界。
+这是一个 Battlecode 风格的短局群智对决原型，同时保留向持久世界、外部 Agent 和可编程规则扩展的边界。
 
-当前架构说明见 [docs/architecture.md](docs/architecture.md)。世界规则位于
-`swarm-core`，无头比赛和回放位于 `swarm-runner`，Bevy 只负责观战界面。
+## Architecture
 
-## Bot arena boundary
-
-规则引擎与策略已分离：每架无人机都由一个 `Bot` 实例根据受限的
-`Observation` 返回单步 `Intent`；引擎才是唯一能裁决移动、采集、交付和
-交通冲突的一方。内置 AUTO / SCOUT / HYBRID 也通过同一接口运行，不享有
-读取全局地图的特权。自定义 Rust bot 的最小接口与示例见
-[docs/bot-api.md](docs/bot-api.md)。
-
-## 写自己的 Bot
-
-从 [`bots/README.md`](bots/README.md) 和 [`src/bots/my_bot.rs`](src/bots/my_bot.rs) 开始。游戏中按 `M` 选择蓝队使用 `MyBot`，再按 `R` 或 `Enter` 重开比赛；比赛结束后，逐回合行为记录会写入 `replays/seed-<seed>.log`。
-
-## Run
-
-```bash
-cargo run
+```text
+swarm-core        纯 Rust 世界规则、观察、意图和裁决
+      ↓
+swarm-runner      Bot 调度、回合推进、回放与 RenderSnapshot
+      ↓
+swarm-space       134KB Rust/WASM 适配器，只序列化展示快照
+      ↓
+Canvas Web UI     绘制、交互、回放控制和调试视角
 ```
 
-## Web
+模拟核心和 runner 不依赖渲染引擎或浏览器 API。Web 客户端不能直接修改权威世界，只能推进 runner 并读取稳定快照。详细说明见 [docs/architecture.md](docs/architecture.md)。
 
-浏览器版本使用 WASM 运行同一个 Bevy 观战界面：
+原 Bevy 观战器已经移出主仓库并单独归档；主产品不再下载 Bevy 渲染器和完整中文字体。
+
+## Run the Web client
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -37,39 +30,49 @@ cargo install trunk --locked --version 0.21.14
 trunk serve
 ```
 
-推送 `master` 后可自动发布到 `swarm.freexlib.com`，首次服务器与 DNS 配置见
-[docs/deployment.md](docs/deployment.md)。
+打开终端输出的本地地址。浏览器端使用系统字体，没有外部图片或字体依赖。
 
-## Controls
+### Controls
 
 - `Space`：暂停/继续
-- `N`：暂停时单步推进一回合
-- `T`：教学模式（自动暂停，逐回合显示每架无人机的决策）
-- `M`：切换蓝队为 `MyBot`（修改 `src/bots/my_bot.rs` 后重开）
-- `1` / `2` / `3`：1× / 4× / 16× 速度
-- `R`：用当前地图重新开始
-- `G`：生成新的对称地图并开始
-- `F11`：窗口/全屏切换
+- `N`：单步推进
+- `R`：重开当前地图
+- `G`：生成新种子地图
+- `1` / `2` / `3`：1× / 4× / 16×
+- 点击无人机：查看角色、货物、目标和决策原因
+- 全局/蓝队/橙队：切换历史观察权限
 
-## Current rules
+## Write a Bot
 
-- 24×16 网格、旋转对称地图
-- Azure：Greedy Bot，优先最近的已知资源
-- Amber：Explorer Bot，一架侦察机与两架分工运输机
-- 每架无人机最多携带 3 点能量
-- 可见范围为曼哈顿距离 5 格，发现的信息会在队内共享
-- 无人机每回合可移动、采集、交付或等待
-- 同一目的地发生冲突时，移动会被取消
-- 回合上限 300，资源耗尽且没有携带货物时也会提前结束
-
-模拟规则由 `crates/swarm-core` 暴露，不依赖 Bevy 的渲染 API；核心实现位于 `crates/swarm-core/src/`。Bevy 只负责观战界面。这使得未来可以把模拟核心编译为 WASM，并接入 xshow 的“群智空间”页面。
-
-核心还包含移动协商、不可达目标放弃、目标稳定性和死锁保护。workspace 测试会在 32 个不同 seed 上验证确定性、终局和无长期停摆。
-
-## Tests
+Bot 只能读取 `Observation` 并返回一个 `Intent`。引擎负责验证动作并同时结算所有无人机的决定。
 
 ```bash
-cargo test
+cargo run --example my_bot
 ```
 
-测试覆盖固定 seed 的确定性、地图对称性，以及比赛能够完成并产生有效交付结果。
+从 [`examples/my_bot.rs`](examples/my_bot.rs) 开始，接口说明见 [docs/bot-api.md](docs/bot-api.md)。
+
+## Rules
+
+- 默认 24×16 旋转对称地图
+- Azure 使用 Autonomous 基准策略
+- Amber 使用 Hybrid Scout 基准策略
+- 每架无人机最多携带 3 点能量
+- 曼哈顿可见范围为 5，发现的信息在队内共享
+- 每回合可移动、采集、交付或等待
+- 同一目的地冲突由世界引擎统一裁决
+- 默认回合上限 300；资源耗尽且无人携货时提前结束
+
+## Verify
+
+```bash
+cargo test --workspace
+cargo check --workspace --target wasm32-unknown-unknown
+trunk build --release
+```
+
+`dist/` 是构建产物，不提交 Git。当前 release 总体积约 176KB，其中 WASM 约 134KB。
+
+## Deploy
+
+推送 `master` 后，仓库专用的 GitHub self-hosted runner 会在服务器本机构建、测试并发布到 `https://swarm.freexlib.com`，不再跨境上传完整构建产物。配置见 [docs/deployment.md](docs/deployment.md)。

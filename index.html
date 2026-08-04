@@ -3,58 +3,122 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#061127" />
+    <meta name="theme-color" content="#07111f" />
     <meta
       name="description"
-      content="群智空间：观察两支自治无人机群体探索、协作并争夺浮空岛能源。"
+      content="群智空间：观察自治无人机群体探索、协作并争夺浮空岛能源。"
     />
     <title>群智空间 · Swarm Space</title>
-    <link data-trunk rel="copy-file" href="assets/HiraginoSansGB.ttf" data-target-path="assets" />
-    <link data-trunk rel="rust" data-bin="swarm-space" data-wasm-opt="0" />
-    <style>
-      :root {
-        color-scheme: dark;
-        background: #061127;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      html,
-      body {
-        width: 100%;
-        height: 100%;
-        margin: 0;
-        overflow: hidden;
-        background: #061127;
-      }
-
-      #swarm-space {
-        display: block;
-        width: 100%;
-        height: 100%;
-        outline: none;
-      }
-
-      .loading {
-        position: fixed;
-        inset: 0;
-        display: grid;
-        place-items: center;
-        color: #96b6d6;
-        font: 500 14px/1.5 system-ui, sans-serif;
-        letter-spacing: 0.12em;
-        pointer-events: none;
-      }
-
-      body:has(#swarm-space[width]) .loading {
-        display: none;
-      }
-    </style>
+    <link data-trunk rel="css" href="web/styles.css" />
+    <link data-trunk rel="copy-file" href="web/app.js" />
+    <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="0" />
   </head>
   <body>
-    <div class="loading">LOADING SWARM SPACE…</div>
-    <canvas id="swarm-space" tabindex="0" aria-label="群智空间对战观测界面"></canvas>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">◈</span>
+          <div>
+            <p>SWARM SPACE / LIVE ARENA</p>
+            <h1>群智空间</h1>
+          </div>
+        </div>
+        <div class="top-metrics" aria-live="polite">
+          <span>回合 <strong id="turn-value">0</strong></span>
+          <span>种子 <strong id="seed-value">—</strong></span>
+          <span id="runtime-badge" class="runtime-badge">加载核心</span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section class="arena-card">
+          <div class="arena-toolbar">
+            <div class="score azure"><span>AZURE</span><strong id="azure-score">0</strong></div>
+            <div class="match-progress" aria-label="比赛进度">
+              <span id="progress-label">0 / 300</span>
+              <i><b id="progress-fill"></b></i>
+            </div>
+            <div class="score amber"><span>AMBER</span><strong id="amber-score">0</strong></div>
+          </div>
+          <div id="canvas-wrap" class="canvas-wrap">
+            <canvas id="arena" aria-label="无人机群体对战地图"></canvas>
+            <div id="loading" class="loading-panel">
+              <span class="loading-orbit" aria-hidden="true"></span>
+              <strong>正在加载模拟核心</strong>
+              <small>轻量 Rust 规则引擎 · 无 Bevy 渲染依赖</small>
+            </div>
+            <div id="canvas-error" class="error-panel" hidden>
+              <strong>核心加载失败</strong>
+              <span id="error-message">请刷新页面重试。</span>
+              <button id="retry-button">重新加载</button>
+            </div>
+          </div>
+          <div class="playback-bar">
+            <button id="restart-button" title="重新开始当前地图">↺</button>
+            <button id="step-button" title="推进一个回合">单步</button>
+            <button id="play-button" class="primary">▶ 开始</button>
+            <button id="new-seed-button" title="生成一张新地图">新地图</button>
+            <div class="speed-group" aria-label="播放速度">
+              <button data-speed="1">1×</button>
+              <button data-speed="4" class="active">4×</button>
+              <button data-speed="16">16×</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <section class="panel overview-panel">
+            <p class="eyebrow">MATCH SIGNAL</p>
+            <h2 id="match-title">等待模拟核心</h2>
+            <p id="match-explanation">世界规则将在浏览器中确定性运行。</p>
+            <div class="strategy-grid">
+              <span><i class="azure-dot"></i><b id="azure-strategy">—</b></span>
+              <span><i class="amber-dot"></i><b id="amber-strategy">—</b></span>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <p class="eyebrow">VISIBILITY</p>
+              <span>切换观察权限</span>
+            </div>
+            <div class="view-tabs">
+              <button data-view="all" class="active">全局</button>
+              <button data-view="azure">蓝队</button>
+              <button data-view="amber">橙队</button>
+            </div>
+          </section>
+
+          <section class="panel drone-panel">
+            <div class="panel-heading">
+              <p class="eyebrow">SELECTED AGENT</p>
+              <span>点击地图中的无人机</span>
+            </div>
+            <div id="drone-empty" class="empty-state">尚未选择无人机</div>
+            <div id="drone-detail" hidden>
+              <div class="agent-title"><span id="agent-swatch"></span><strong id="agent-name"></strong></div>
+              <dl>
+                <div><dt>角色</dt><dd id="agent-role"></dd></div>
+                <div><dt>载荷</dt><dd id="agent-cargo"></dd></div>
+                <div><dt>位置</dt><dd id="agent-position"></dd></div>
+                <div><dt>目标</dt><dd id="agent-target"></dd></div>
+              </dl>
+              <p id="agent-reason" class="agent-reason"></p>
+            </div>
+          </section>
+
+          <section class="panel event-panel">
+            <div class="panel-heading">
+              <p class="eyebrow">WORLD EVENTS</p>
+              <button id="clear-events">清空</button>
+            </div>
+            <div id="event-list" class="event-list" aria-live="polite">
+              <p><time>0</time><span>竞技场尚未启动。</span></p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

@@ -1,50 +1,61 @@
 # Swarm Space architecture
 
-当前运行时已经分成三条边界：
+Swarm Space 把权威世界、Agent 调度、传输协议和表现层分成四条边界：
 
 ```text
-swarm-core       世界规则、Observation/Decision、Bot Contract
+swarm-core
+  世界状态、Observation、Intent、Decision、规则裁决
       ↓
-swarm-runner     无头比赛、逐回合推进、批量运行、回放、RenderSnapshot
+swarm-runner
+  独立 Bot 实例、AgentMemory、TickBudget、回放、RenderSnapshot
       ↓
-RenderSnapshot   稳定的渲染数据协议，不暴露 Simulation/Drone 内部结构
+WebMatch adapter
+  将 RenderSnapshot 转成稳定 JSON DTO
       ↓
-swarm-space      Bevy viewer、摄像机、雾效、UI 和输入
+Canvas client
+  地图绘制、局部视角、播放控制、Agent 检查器
 ```
 
-比赛生命周期通过消息协议交互，而不是共享运行器对象：
+## Authority
 
-```text
-Bevy / CLI ── MatchCommand ──> runner thread
-Bevy / CLI <─ MatchEvent ───── runner thread
-Bevy / CLI <─ WorldSnapshot ── runner thread
-```
+`swarm-core::Simulation` 是唯一世界权威。Bot 不能持有 Simulation，也不能直接移动实体；它只读取受限 `Observation` 并提交一个 `Intent`。核心收齐同一回合的决定后，再验证相邻移动、墙体、货物和交通冲突。
 
-Bot 调度也位于 runner：runner 为每架无人机构造 `Observation`、调用 Bot
-并收集 `Decision`，随后把完整决策集交给 `swarm-core::resolve_tick`。核心仍
-负责观察数据的构造和所有规则裁决，但不再是比赛执行路径上的 Bot 调度器。
-`Simulation::step` 和 `with_bot_factory` 只作为兼容性的便捷 API 保留。
+## Scheduling
 
-每个 Bot 还拥有 runner 管理的持久 `AgentMemory`，每个 tick 接收确定性的
-`TickBudget`。Bot 只能通过 `MemoryPatch` 更新自己的记忆，不能借此修改世界；
-预算耗尽的决策会被裁判降级为 `Wait`。
+`swarm-runner` 为每架无人机构造独立 Bot 和持久 `AgentMemory`。每个 tick 使用确定性的 `TickBudget`，避免平台相关的墙钟时间影响比赛结果。runner 输出：
 
-`swarm-core` 没有 Bevy 依赖，可以单独测试。`swarm-runner` 也没有 Bevy
-依赖，因此 CLI、服务器和未来 WASM 适配器可以复用它。Bevy 主程序只持有
-`RunnerHandle`、命令和当前快照，不持有 `MatchRunner`，负责把快照映射为
-ECS 实体。
+- `MatchEvent`：回合和终局事件；
+- `WorldEvent`：移动、采集和交付等结构化事实；
+- `RenderSnapshot`：不暴露内部容器的表现协议；
+- replay：可回放的逐回合历史。
 
-`MatchEvent` 用于描述回合推进和终局事件；其中的 `WorldEvent` 使用结构化
-移动、采集和交付记录。它是未来网络同步、回放播放器和网页观战端可以复用
-的协议边界。回放文件由 runner 写出，Bevy 不负责持久化。
+## Web boundary
 
-Bevy ECS 只管理表现实体，不是规则引擎的权威状态。规则引擎保持独立的
-`Simulation`，每回合通过 `RenderSnapshot` 同步到表现层；这样可以继续支持
-无头比赛、服务器和 WASM，而不把 Bevy 引入核心。
+根 crate 是一个很小的 `wasm-bindgen` 适配器。它只暴露：
 
-## 推荐扩展位置
+- 创建或重开比赛；
+- 推进一步或有限批量回合；
+- 查询是否结束；
+- 获取序列化快照。
 
-- 新规则：`swarm-core`
-- 批量比赛、统计、回放：`swarm-runner`
-- Bot 适配器：独立 Bot crate 或 runner adapter
-- 画面、交互、地图操作：`swarm-space`
+Canvas 客户端不复制寻路、资源或冲突规则。它可以更换为 WebGL、远程 WebSocket 或其他 UI，而不改变核心。
+
+## ECS decision
+
+当前不依赖 `bevy_ecs`。代码只借鉴 ECS 的职责拆分：
+
+- 组件数据使用普通 Rust struct；
+- 系统使用输入输出明确的函数；
+- 世界资源属于 Simulation；
+- 决策和结算阶段显式排序；
+- 实体使用稳定业务 ID。
+
+只有当动态组件组合、插件调度或实体规模证明需要 ECS 存储时，才考虑单独引入 `bevy_ecs`，而不是完整 Bevy 引擎。
+
+## Extension points
+
+- 新世界规则：`swarm-core`
+- 新 Bot、比赛调度、批量统计：`swarm-runner` 或独立 adapter crate
+- 网络协议：从 `RenderSnapshot` / `WorldEvent` 派生版本化 DTO
+- 画面与交互：`web/`
+- 自定义 Bot 入门：`examples/my_bot.rs`

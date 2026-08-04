@@ -1,6 +1,6 @@
 //! Headless match runner for Swarm Space.
 //!
-//! This crate deliberately knows nothing about Bevy. It is the seam for CLI
+//! This crate deliberately knows nothing about a renderer. It is the seam for CLI
 //! tournaments, server matches, replay generation, and future WASM adapters.
 
 #[cfg(target_arch = "wasm32")]
@@ -616,7 +616,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runner_finishes_without_bevy() {
+    fn runner_finishes_without_a_renderer() {
         let result = run_baseline(42, Scenario::default());
         assert!(result.turns > 0);
         assert!(!result.replay.is_empty());

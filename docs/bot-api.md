@@ -30,13 +30,17 @@ The runner may also provide persistent per-drone `AgentMemory` and a logical
 Bot state, not authoritative world state; only the runner persists it between
 ticks.
 
-To run a custom bot for every drone, construct a simulation with a factory:
+To run a custom bot through the runner-owned scheduler, construct a runner with
+a factory:
 
 ```rust
-let sim = Simulation::with_bot_factory(seed, scenario, |team, id| {
+let runner = MatchRunner::with_bot_factory(seed, scenario, |team, id| {
     Box::new(MyBot::new(team, id))
 });
 ```
+
+A complete executable example is available in `examples/my_bot.rs` and can be
+run with `cargo run --example my_bot`.
 
 For runners that own bot scheduling, create a world with
 `Simulation::without_bots`, call `observation_for` for each drone, collect one
