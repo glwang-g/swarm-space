@@ -6,7 +6,7 @@ const ui = Object.fromEntries([
   "new-seed-button", "drone-empty", "drone-detail", "agent-swatch", "agent-name",
   "agent-role", "agent-cargo", "agent-position", "agent-target", "agent-reason",
   "event-list", "clear-events"
-].map((id) => [id, document.getElementById(id)]));
+].map((id) => [id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), document.getElementById(id)]));
 
 const state = {
   game: null,
@@ -372,4 +372,18 @@ function boardLabel(x, y) {
 window.addEventListener("TrunkApplicationStarted", start, { once: true });
 window.addEventListener("error", (event) => { if (!state.game) showError(event.error ?? event.message); });
 window.addEventListener("unhandledrejection", (event) => { if (!state.game) showError(event.reason); });
-if (window.wasmBindings?.WebMatch) start();
+
+// Trunk's inline WASM loader uses top-level await. The external app module can
+// therefore execute before `wasmBindings` exists and miss the startup event.
+// Keep checking briefly so a slow or cached browser never leaves the controls
+// inert on the loading screen.
+function waitForBindings() {
+  if (state.game) return;
+  if (window.wasmBindings?.WebMatch) {
+    start();
+    return;
+  }
+  window.setTimeout(waitForBindings, 25);
+}
+
+waitForBindings();
