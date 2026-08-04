@@ -12,6 +12,19 @@ git@github.com:glwang-g/swarm-space.git
 `living-world` 是早期的独立原型，保留在它自己的仓库中，不再作为
 Swarm Space 的工作目录，也不应把两个项目的代码或部署脚本混在一起。
 
+## Freexlib entry points
+
+主域名现在是统一门户：<https://freexlib.com>。三个应用各自保留独立入口：
+
+| 地址 | 内容 |
+| --- | --- |
+| <https://swarm.freexlib.com> | Swarm Space 群智空间 |
+| <https://labs.freexlib.com> | XShow Labs 实验室 |
+| <https://living.freexlib.com> | Living World 旧聚落原型 |
+
+门户源文件位于 [`portal/index.html`](../portal/index.html)，并会随 master
+部署一起同步到服务器。
+
 ## Current product shape
 
 当前浏览器客户端是 Rust/WASM + Canvas，权威状态位于 `swarm-core`，回合与
