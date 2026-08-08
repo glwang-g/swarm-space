@@ -76,3 +76,5 @@ trunk build --release
 ## Deploy
 
 推送 `master` 后，仓库专用的 GitHub self-hosted runner 会在服务器本机构建、测试并发布到 `https://swarm.freexlib.com`，不再跨境上传完整构建产物。配置见 [docs/deployment.md](docs/deployment.md)。
+
+Freexlib 门户已迁到同级 `freexlib-portal` 仓库独立维护与部署；跨项目世界契约也位于该仓库（`docs/world-contract.md` / `docs/world-contract.zh-CN.md`）。

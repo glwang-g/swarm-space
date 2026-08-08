@@ -19,6 +19,9 @@ automation.
 - `src/lib.rs`: small Rust/WASM browser adapter.
 - `web/` and `index.html`: Canvas client only; it does not own world state.
 - `examples/` and `bots/`: bot authoring surface.
+- The Freexlib portal and the cross-project world contract live in the sibling
+  `freexlib-portal` repository (`docs/world-contract.md`); this repo no longer
+  owns the portal.
 
 The former Bevy viewer is archived outside this repository at
 `/Users/mac/works/github.com/swarm-space-bevy-archive` on the development

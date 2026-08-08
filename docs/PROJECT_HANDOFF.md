@@ -22,8 +22,9 @@ Swarm Space 的工作目录，也不应把两个项目的代码或部署脚本�
 | <https://labs.freexlib.com> | XShow Labs 实验室 |
 | <https://living.freexlib.com> | Living World 旧聚落原型 |
 
-门户源文件位于 [`portal/index.html`](../portal/index.html)，并会随 master
-部署一起同步到服务器。
+门户已迁到独立的同级仓库 `freexlib-portal`（门户首页 + 跨项目世界契约），不再随本
+仓库部署。门户仓库需要自行配置 CI 发布到 `https://freexlib.com`；跨项目世界
+契约见 `freexlib-portal/docs/world-contract.md`（中文版 `world-contract.zh-CN.md`）。
 
 ## Current product shape
 
