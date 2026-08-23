@@ -32,6 +32,23 @@ pub struct ReplayTurn {
     pub world_events: Vec<WorldEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleMissionEvent {
+    pub action: String,
+    pub actor: String,
+    pub consequences: Vec<String>,
+    pub facts: Vec<String>,
+    pub tick: u32,
+}
+
+pub fn project_rule_mission_event(tick: u32, event: &WorldEvent) -> RuleMissionEvent {
+    match event {
+        WorldEvent::Moved { drone_id, team, from, to } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "move".into(), facts: vec![format!("moved {} -> {}", from.board_label(), to.board_label())], consequences: vec!["new local observation".into()] },
+        WorldEvent::Harvested { drone_id, team, position, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "harvest".into(), facts: vec![format!("collected {} at {}", amount, position.board_label())], consequences: vec!["team cargo increased".into()] },
+        WorldEvent::Deposited { drone_id, team, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "deposit".into(), facts: vec![format!("delivered {} energy", amount)], consequences: vec!["team score increased".into()] },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MatchResult {
     pub seed: u64,
@@ -689,5 +706,14 @@ mod tests {
             runner.memories[0].assigned_target,
             Some(swarm_core::Pos::new(2, 2))
         );
+    }
+
+    #[test]
+    fn world_events_project_to_rule_mission_events() {
+        let event = WorldEvent::Harvested { drone_id: 0, team: Team::Azure, position: swarm_core::Pos::new(4, 7), amount: 2 };
+        let projected = project_rule_mission_event(9, &event);
+        assert_eq!(projected.tick, 9);
+        assert_eq!(projected.action, "harvest");
+        assert!(projected.consequences.iter().any(|item| item.contains("cargo")));
     }
 }
