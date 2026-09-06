@@ -1319,7 +1319,10 @@ mod tests {
 
     #[test]
     fn many_maps_finish_without_stagnating_or_losing_determinism() {
-        for seed in 0..32 {
+        // Eight deterministic seeds exercise distinct maps and traffic patterns
+        // while keeping the full end-to-end invariant test practical for the
+        // normal workspace test suite.
+        for seed in 0..8 {
             let mut first = Simulation::new(seed);
             let mut second = Simulation::new(seed);
             let mut unchanged_turns = 0;

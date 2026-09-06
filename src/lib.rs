@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 use swarm_core::{Pos, Role, Scenario, Team};
-use swarm_runner::{MatchRunner, RenderSnapshot};
+use swarm_runner::{MatchRunner, RenderSnapshot, RuleMissionEvent};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -51,9 +51,11 @@ impl WebMatch {
     }
 
     pub fn snapshot_json(&self) -> String {
+        let rule_missions = self.runner.last_rule_mission_events();
         serde_json::to_string(&SnapshotDto::from_snapshot(
             self.seed,
             self.runner.snapshot(),
+            rule_missions,
         ))
         .expect("render snapshot must serialize")
     }
@@ -77,10 +79,12 @@ struct SnapshotDto {
     finished: bool,
     last_event: String,
     turn_explanation: String,
+    #[serde(rename = "rule_missions")]
+    rule_missions: Vec<RuleMissionDto>,
 }
 
 impl SnapshotDto {
-    fn from_snapshot(seed: u64, snapshot: RenderSnapshot) -> Self {
+    fn from_snapshot(seed: u64, snapshot: RenderSnapshot, rule_missions: Vec<RuleMissionEvent>) -> Self {
         let drones = snapshot
             .drones
             .iter()
@@ -139,8 +143,23 @@ impl SnapshotDto {
             finished: snapshot.finished,
             last_event: snapshot.last_event,
             turn_explanation: snapshot.turn_explanation,
+            rule_missions: rule_missions.into_iter().map(RuleMissionDto::from).collect(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct RuleMissionDto {
+    tick: u32,
+    actor: String,
+    action: String,
+    facts: Vec<String>,
+    consequences: Vec<String>,
+    visible_to: Vec<String>,
+}
+
+impl From<RuleMissionEvent> for RuleMissionDto {
+    fn from(event: RuleMissionEvent) -> Self { Self { tick: event.tick, actor: event.actor, action: event.action, facts: event.facts, consequences: event.consequences, visible_to: event.visible_to } }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -222,14 +241,21 @@ mod tests {
         assert_eq!(value["turn"], 0);
         assert_eq!(value["width"], 24);
         assert_eq!(value["drones"].as_array().map(Vec::len), Some(6));
+        assert_eq!(value["rule_missions"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]
     fn browser_adapter_advances_the_authoritative_runner() {
         let mut game = WebMatch::new(7);
         assert!(game.step());
-        let value: serde_json::Value =
-            serde_json::from_str(&game.snapshot_json()).expect("valid snapshot JSON");
+        let value: serde_json::Value = serde_json::from_str(&game.snapshot_json()).expect("valid snapshot JSON");
+        let missions = value["rule_missions"].as_array().expect("rule missions array");
+        assert!(!missions.is_empty(), "first resolved turn should explain at least one action");
+        let mission = &missions[0];
+        for field in ["tick", "actor", "action", "facts", "consequences", "visible_to"] {
+            assert!(!mission[field].is_null(), "missing Rule Mission field: {field}");
+        }
+        assert!(mission["visible_to"].as_array().is_some_and(|audience| !audience.is_empty()));
         assert_eq!(value["turn"], 1);
     }
 }

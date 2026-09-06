@@ -5,7 +5,7 @@ const ui = Object.fromEntries([
   "azure-strategy", "amber-strategy", "play-button", "step-button", "restart-button",
   "new-seed-button", "drone-empty", "drone-detail", "agent-swatch", "agent-name",
   "agent-role", "agent-cargo", "agent-position", "agent-target", "agent-reason",
-  "event-list", "clear-events"
+  "event-list", "clear-events", "rule-mission-list"
 ].map((id) => [id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), document.getElementById(id)]));
 
 const state = {
@@ -99,7 +99,27 @@ function updateInterface() {
   ui.playButton.textContent = state.running ? "Ⅱ 暂停" : (s.finished ? "比赛结束" : "▶ 开始");
   ui.playButton.disabled = s.finished;
   renderEvents();
+  renderRuleMissions();
   renderSelectedAgent();
+}
+
+function renderRuleMissions() {
+  const missions = (state.snapshot.rule_missions || []).filter((mission) => state.view === "all" || mission.visible_to.includes(state.view.toUpperCase()));
+  if (!missions.length) {
+    ui.ruleMissionList.innerHTML = `<p>${state.snapshot.rule_missions?.length && state.view !== "all" ? "当前队伍没有观察到本回合规则事件。" : "本回合还没有可解释的规则事件。"}</p>`;
+    return;
+  }
+  ui.ruleMissionList.replaceChildren(...missions.map((mission) => {
+    const row = document.createElement("article");
+    const title = document.createElement("strong");
+    const facts = document.createElement("p");
+    const consequences = document.createElement("p");
+    title.textContent = `${mission.actor} · ${mission.action}`;
+    facts.textContent = `事实：${mission.facts.join("；")}`;
+    consequences.textContent = `后果：${mission.consequences.join("；")}`;
+    row.append(title, facts, consequences);
+    return row;
+  }));
 }
 
 function winnerText(snapshot) {
@@ -299,6 +319,7 @@ function bindControls() {
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
     state.view = button.dataset.view;
     document.querySelectorAll("[data-view]").forEach((item) => item.classList.toggle("active", item === button));
+    updateInterface();
     draw();
   }));
   ui.arena.addEventListener("click", selectAgent);

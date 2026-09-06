@@ -39,13 +39,16 @@ pub struct RuleMissionEvent {
     pub consequences: Vec<String>,
     pub facts: Vec<String>,
     pub tick: u32,
+    /// The owning team observes its agent's action; other views can use the
+    /// same projection without leaking unexplored information.
+    pub visible_to: Vec<String>,
 }
 
 pub fn project_rule_mission_event(tick: u32, event: &WorldEvent) -> RuleMissionEvent {
     match event {
-        WorldEvent::Moved { drone_id, team, from, to } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "move".into(), facts: vec![format!("moved {} -> {}", from.board_label(), to.board_label())], consequences: vec!["new local observation".into()] },
-        WorldEvent::Harvested { drone_id, team, position, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "harvest".into(), facts: vec![format!("collected {} at {}", amount, position.board_label())], consequences: vec!["team cargo increased".into()] },
-        WorldEvent::Deposited { drone_id, team, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "deposit".into(), facts: vec![format!("delivered {} energy", amount)], consequences: vec!["team score increased".into()] },
+        WorldEvent::Moved { drone_id, team, from, to } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "move".into(), facts: vec![format!("moved {} -> {}", from.board_label(), to.board_label())], consequences: vec!["new local observation".into()], visible_to: vec![team.label().into()] },
+        WorldEvent::Harvested { drone_id, team, position, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "harvest".into(), facts: vec![format!("collected {} at {}", amount, position.board_label())], consequences: vec!["team cargo increased".into()], visible_to: vec![team.label().into()] },
+        WorldEvent::Deposited { drone_id, team, amount } => RuleMissionEvent { tick, actor: format!("{}-{}", team.label(), drone_id + 1), action: "deposit".into(), facts: vec![format!("delivered {} energy", amount)], consequences: vec!["team score increased".into()], visible_to: vec![team.label().into()] },
     }
 }
 
@@ -586,6 +589,12 @@ impl MatchRunner {
         self.simulation.snapshot().into()
     }
 
+    /// Teaching-facing projection for the most recently resolved turn. The
+    /// native replay remains authoritative; adapters may serialize this view.
+    pub fn last_rule_mission_events(&self) -> Vec<RuleMissionEvent> {
+        self.replay.last().map(|turn| turn.world_events.iter().map(|event| project_rule_mission_event(turn.turn, event)).collect()).unwrap_or_default()
+    }
+
     pub fn run_to_end(&mut self) -> MatchResult {
         while !self.simulation.is_finished() {
             self.step();
@@ -715,5 +724,6 @@ mod tests {
         assert_eq!(projected.tick, 9);
         assert_eq!(projected.action, "harvest");
         assert!(projected.consequences.iter().any(|item| item.contains("cargo")));
+        assert_eq!(projected.visible_to, vec!["AZURE"]);
     }
 }

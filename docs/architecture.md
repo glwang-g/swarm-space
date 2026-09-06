@@ -26,8 +26,18 @@ Canvas client
 
 - `MatchEvent`：回合和终局事件；
 - `WorldEvent`：移动、采集和交付等结构化事实；
+- `RuleMissionEvent`：由 `WorldEvent` 投影出的 `tick / actor / action / facts / consequences / visible_to` 教学事件，且保持所属队伍的可见性；
 - `RenderSnapshot`：不暴露内部容器的表现协议；
 - replay：可回放的逐回合历史。
+
+2026-09-04 已通过 `cargo test --workspace --all-targets` 与
+`cargo check --workspace --target wasm32-unknown-unknown` 验证。
+
+WASM 快照还携带本回合的 `rule_missions`，因此 Canvas/外部教学层可以消费
+投影事件，而不需要访问 runner 或原生 `Simulation`。
+Canvas 的检查器会按全局/队伍观察权限过滤并展示这些回执，同时保留原生世界事件列表。
+适配器测试会在首回合断言至少一条回执及全部共享字段，防止该传输边界退化。
+`web/app-ui.test.mjs` 还锁定检查器面板、可见性过滤和原生日志共存这一前端边界。
 
 ## Web boundary
 

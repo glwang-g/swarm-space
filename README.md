@@ -20,6 +20,10 @@ Canvas Web UI     绘制、交互、回放控制和调试视角
 
 模拟核心和 runner 不依赖渲染引擎或浏览器 API。Web 客户端不能直接修改权威世界，只能推进 runner 并读取稳定快照。详细说明见 [docs/architecture.md](docs/architecture.md)。
 
+`swarm-runner` 还会把原生 `WorldEvent` 投影为与 Freexlib 世界契约一致的
+`RuleMissionEvent`（含 `visible_to` 队伍视野）。这为规则教学、回放和未来代理
+界面提供可解释事件，而不改变 `swarm-core` 的权威边界。
+
 原 Bevy 观战器已经移出主仓库并单独归档；主产品不再下载 Bevy 渲染器和完整中文字体。
 
 ## Run the Web client
@@ -68,6 +72,7 @@ cargo run --example my_bot
 ```bash
 cargo test --workspace
 cargo check --workspace --target wasm32-unknown-unknown
+node --test web/app-ui.test.mjs
 trunk build --release
 ```
 
